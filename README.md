@@ -1,669 +1,164 @@
-# opencode-model-router
+# zcode-model-router
 
 > **Use the cheapest model that can do the job. Automatically.**
 
-An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with ~210 tokens of overhead.
+A zcode plugin that routes every coding task to the right-priced tier — automatically, on every message — via smart subagent delegation.
+
+Adapted from [opencode-model-router](https://github.com/marco-jardim/opencode-model-router) v1.3 to zcode's Claude Code-compatible plugin architecture: agents, hooks, and commands instead of the OpenCode plugin API.
 
 ## Why it's different
 
-Most AI coding tools give you one model for everything. You pay Opus prices to run `grep`. opencode-model-router changes that with a stack of interlocking ideas:
+Most AI coding tools run one model for everything. You pay flagship-model prices to run `grep`. zcode-model-router changes that:
 
-**Use a mid-tier model as orchestrator.**
-The orchestrator runs on *every* message. Put Sonnet there, not Opus. Sonnet reads a routing protocol and delegates just as well as Opus — at 4x lower cost. Reserve Opus for when it genuinely matters.
+**Run a mid-tier orchestrator, delegate everything else.**
+The orchestrator runs on *every* message. Put a mid-priced model there. The router injects a dense delegation protocol that teaches it to dispatch read-only work to a cheap subagent and reserve the heavy tier for architecture/debug — at a fraction of the cost.
 
-**Inject a compressed, LLM-optimized routing protocol.**
-Instead of verbose instructions, the plugin injects ~210 tokens of dense, machine-readable notation the orchestrator understands perfectly. Same routing intelligence as 870 tokens of prose — 75% smaller. Every message, every session.
+**Injected delegation protocol (~1 page, every message).**
+A `UserPromptSubmit` hook injects the protocol as context on every user message: tier models + cost ratios, a keyword task taxonomy, hard routing rules, dispatch caps, and the multi-phase decomposition pattern (explore cheap → execute smart).
 
-**Match task to tier using a configurable taxonomy.**
-A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/test`, `@heavy→arch/debug/security`) tells the orchestrator exactly which tier fits each task type. Fully customizable. No ambiguity.
+**Tier subagents with per-tier models.**
+Three subagents ship out of the box (`fast` / `medium` / `heavy`), each a static agent file with its own `model` and `thoughtLevel`. Your default Z.ai stack:
 
-**Split separable composite tasks: explore cheap, execute smart.**
-"Find how auth works and refactor it" shouldn't cost @medium for the whole thing. The multi-phase guidance prefers a split when phases are separable: @fast reads the files (1x cost), @medium does the rewrite (5x cost). ~36% savings on composite tasks, which are ~65% of real coding sessions.
+| Tier | Model | Reasoning | Cost ratio | Read-only cap |
+|------|-------|-----------|-----------:|--------------:|
+| `@fast` | GLM-4.7 | — | 1x | 8 |
+| `@medium` | GLM-5.3 | high | 5x | 5 |
+| `@heavy` | GLM-5.3 | max | 20x | 3 |
 
-**Skip delegation overhead for trivial work.**
-Single grep? One file read (or a quick follow-up)? The orchestrator can execute directly — zero delegation cost, zero latency.
+> GLM-4.7 not available on your plan? Switch to the `zai-turbo` preset (`GLM-5-Turbo` / `GLM-5.2` / `GLM-5.3 max`) with `/preset zai-turbo` + `npm run sync-agents`.
 
-**Four routing modes for different budgets.**
-`/budget normal` (balanced), `/budget budget` (aggressive savings, defaults everything to @fast), `/budget quality` (liberal use of stronger models), `/budget deep` (heavy-first for long architecture/debug runs). Mode persists across restarts.
-
-**Cost ratios in the prompt.**
-Every tier carries its `costRatio` (fast=1x, medium=5x, heavy=20x) injected into the system prompt. The orchestrator sees the price before deciding. It picks the cheapest tier that can reliably handle the task.
-
-**Orchestrator-awareness.**
-If the orchestrator is already running on Opus, the rule `self∈opus→never→@heavy` fires — it does the heavy work itself rather than delegating to another Opus instance.
-
-**Multi-provider support with automatic fallback.**
-Four presets out of the box: Anthropic, OpenAI, GitHub Copilot, Google. Switch with `/preset`. If a provider fails, the fallback chain tries the next one automatically.
-
-**Plan annotation for long tasks.**
-`/annotate-plan` reads a markdown plan and tags each step with `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` — removing all routing ambiguity from multi-step workflows.
-
-**Fully configurable.**
-Tiers, models, cost ratios, rules, task patterns, routing modes, fallback chains — all in `tiers.json`. No code changes needed.
-
-## The problem
-
-Vibe coding is expensive because most AI coding tools default to one model for everything. That model is usually the most capable available — and you pay for that capability even when the task is `grep for a function name`.
-
-A typical coding session breaks down roughly like this:
-
-| Task type | % of session | Example |
-|-----------|-------------|---------|
-| Exploration / search | ~40% | Find where X is defined, read a file, check git log |
-| Implementation | ~45% | Write a function, fix a bug, add a test |
-| Architecture / deep debug | ~15% | Design a new module, debug after 2+ failures |
-
-If you're running Opus (20x cost) for all of it, you're overpaying by **3-10x** on most tasks.
-
-## The solution
-
-opencode-model-router injects a **delegation protocol** into the system prompt that teaches the orchestrator to:
-
-1. **Match task to tier** using a configurable task taxonomy
-2. **Split composite tasks** — explore first with a cheap model, then implement with a mid-tier model
-3. **Skip delegation overhead** for trivial tasks (1-2 tool calls)
-4. **Never over-qualify** — use the cheapest tier that can reliably handle the task
-5. **Fallback** across providers when one fails
-
-All of this adds ~210 tokens of system prompt overhead per message.
-
-## Cost simulation
-
-**Scenario: 50-message coding session with 30 delegated tasks**
-
-Task distribution: 18 exploration (60%), 10 implementation (33%), 2 architecture (7%)
-
-### Without model router (all-Opus)
-
-| Task | Count | Tier | Cost ratio | Total |
-|------|-------|------|-----------|-------|
-| Exploration | 18 | Opus | 20x | 360x |
-| Implementation | 10 | Opus | 20x | 200x |
-| Architecture | 2 | Opus | 20x | 40x |
-| **Total** | **30** | | | **600x** |
-
-### With model router (normal mode, Sonnet orchestrator)
-
-| Task | Count | Tier | Cost ratio | Total |
-|------|-------|------|-----------|-------|
-| Exploration (delegated) | 10 | @fast | 1x | 10x |
-| Exploration (direct, trivial) | 8 | self | 0x | 0x |
-| Implementation | 10 | @medium | 5x | 50x |
-| Architecture | 2 | @heavy | 20x | 40x |
-| **Total** | **30** | | | **100x** |
-
-### With model router (budget mode, Sonnet orchestrator)
-
-| Task | Count | Tier | Cost ratio | Total |
-|------|-------|------|-----------|-------|
-| Exploration | 18 | @fast | 1x | 18x |
-| Implementation (simple) | 7 | @fast | 1x | 7x |
-| Implementation (complex) | 3 | @medium | 5x | 15x |
-| Architecture | 2 | @medium | 5x | 10x |
-| **Total** | **30** | | | **50x** |
-
-### Summary
-
-| Setup | Session cost | vs all-Opus |
-|-------|-------------|-------------|
-| All-Opus (no router) | 600x | baseline |
-| Sonnet orchestrator + router (normal) | 100x | **−83%** |
-| Sonnet orchestrator + router (budget) | 50x | **−92%** |
-
-> Cost ratios are relative units. Actual savings depend on your provider pricing and model selection.
-
-## How it works
-
-On every message, the plugin injects ~210 tokens into the system prompt. The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it. That's by design: verbose prose would cost 4x more tokens per message with no routing benefit.
-
-What the orchestrator sees (Anthropic preset, normal mode):
+**Runtime cap enforcement (not just prompt rules).**
+Prompt-only caps get ignored. So the router *observes* every read-only tool call a subagent makes (PostToolUse hook) and injects a live counter into its context:
 
 ```
-## Model Delegation Protocol
-Preset: anthropic. Tiers: @fast=claude-haiku-4-5(1x) @medium=claude-sonnet-4-5/max(5x) @heavy=claude-opus-4-6/max(20x). mode:normal
-R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
-Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
-1.[tier:X] tag in plan→delegate X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default preference: read-only→@fast | implementation→@medium 4.orchestrate=self,execute=subagent 5.trivial(≤1 tool call,no expected follow-up)→direct,skip-delegate 6.before @heavy: gather context first(usually via @fast); if already sufficient, dispatch directly 7.if self is opus: skip-@heavy(do locally), still route broader read-only exploration to @fast 8.min(cost,adequate-tier)
-Err→retry-alt-tier→fail→direct. Chain: anthropic→openai→google→github-copilot
-Delegate with Task(subagent_type="fast|medium|heavy", prompt="...").
-Keep orchestration and final synthesis in the primary agent.
-```
-
-**What each line means (for humans):**
-
-| Line | What it encodes |
-|------|----------------|
-| `Tiers: @fast=...(1x) @medium=...(5x) @heavy=...(20x)` | Model + cost ratio per tier, all in one compact token |
-| `R: @fast→search/grep/... @medium→impl/...` | Full task taxonomy — keyword triggers for each tier |
-| `Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable` | Preferred decomposition for separable composite tasks |
-| `1.[tier:X]→... 5.trivial(≤1 tool call)... 6.before @heavy: gather context...` | Numbered routing rules in abbreviated form |
-| `Err→retry-alt-tier→fail→direct. Chain: anthropic→...` | Fallback strategy in one line |
-
-The orchestrator reads this once per message and applies it to every tool call and delegation decision in that turn.
-
-### Multi-phase decomposition (key differentiator)
-
-The most impactful optimization. A composite task like:
-
-> "Find how the auth middleware works and refactor it to use JWT."
-
-Without router → routed entirely to `@medium` (5x for all ~8K tokens)
-
-With router → split:
-- **@fast (1x)**: grep, read 4-5 files, trace call chain (~4K tokens)
-- **@medium (5x)**: rewrite auth module (~4K tokens)
-
-**Result: ~36% cost reduction on composite tasks**, which represent ~60-70% of real coding work.
-
-## Why not just use another orchestrator?
-
-| Feature | model-router | Claude native | oh-my-opencode | GSD | ralph-loop |
-|---------|:---:|:---:|:---:|:---:|:---:|
-| Multi-tier cost routing | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Configurable task taxonomy | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Budget / quality modes | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Multi-phase decomposition | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Cross-provider fallback | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Cost ratio awareness | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Plan annotation with tiers | ✅ | ❌ | ❌ | ❌ | ❌ |
-| ~210 token overhead | ✅ | — | ❌ | ❌ | ❌ |
-
-**Claude native**: single model for everything, no cost routing. If you're using claude.ai or OpenCode without plugins, you're paying the same price for `grep` as for architecture design.
-
-**oh-my-opencode**: focused on workflow personality and prompt style, not cost optimization. No tier routing, no task taxonomy.
-
-**GSD (Get Shit Done)**: prioritizes execution speed and low deliberation overhead. Excellent at pushing through tasks fast, but uses one model — no cost differentiation between search and architecture.
-
-**ralph-loop**: iterative feedback-loop orchestrator. Excellent at self-correction and quality verification. No tier routing — every loop iteration runs on the same model regardless of task complexity.
-
-**The core difference**: the others optimize for *how* the agent works (style, speed, quality loops). model-router optimizes for *what it costs* — with zero compromise on quality, because you can always put Opus in the heavy tier.
-
-## Recommended setup
-
-**Orchestrator**: use `claude-sonnet-4-5` (or equivalent mid-tier) as your primary/default model. Not Opus.
-
-Why: the orchestrator runs on every message, including trivial ones. Sonnet can read the delegation protocol and make routing decisions just as well as Opus. You reserve Opus for when it's genuinely needed — via `@heavy` delegation.
-
-In your `opencode.json`:
-```json
-{
-  "model": "anthropic/claude-sonnet-4-5",
-  "autoshare": false
-}
-```
-
-Then install and configure model-router to handle the rest.
-
-## Installation
-
-### From npm (recommended)
-```bash
-# In your opencode project or globally
-npm install -g opencode-model-router
-```
-
-Add to `~/.config/opencode/opencode.json`:
-```json
-{
-  "plugin": {
-    "opencode-model-router": {
-      "type": "npm",
-      "package": "opencode-model-router"
-    }
-  }
-}
-```
-
-### Local clone
-```bash
-git clone https://github.com/your-username/opencode-model-router
-cd opencode-model-router
-npm install
-```
-
-In `~/.config/opencode/opencode.json`:
-```json
-{
-  "plugin": {
-    "opencode-model-router": {
-      "type": "local",
-      "path": "/absolute/path/to/opencode-model-router"
-    }
-  }
-}
-```
-
-## Configuration
-
-All configuration lives in `tiers.json` at the plugin root.
-
-### Presets
-
-The plugin ships with four presets (switch with `/preset <name>`):
-
-**anthropic** (default):
-| Tier | Model | Cost ratio |
-|------|-------|-----------|
-| @fast | `anthropic/claude-haiku-4-5` | 1x |
-| @medium | `anthropic/claude-sonnet-4-5` (max) | 5x |
-| @heavy | `anthropic/claude-opus-4-6` (max) | 20x |
-
-**openai**:
-| Tier | Model | Cost ratio |
-|------|-------|-----------|
-| @fast | `openai/gpt-5.3-codex-spark` | 1x |
-| @medium | `openai/gpt-5.3-codex` | 5x |
-| @heavy | `openai/gpt-5.3-codex` (xhigh) | 20x |
-
-**github-copilot**:
-| Tier | Model | Cost ratio |
-|------|-------|-----------|
-| @fast | `github-copilot/claude-haiku-4-5` | 1x |
-| @medium | `github-copilot/claude-sonnet-4-5` | 5x |
-| @heavy | `github-copilot/claude-opus-4-6` (thinking) | 20x |
-
-**google**:
-| Tier | Model | Cost ratio |
-|------|-------|-----------|
-| @fast | `google/gemini-2.5-flash` | 1x |
-| @medium | `google/gemini-2.5-pro` | 5x |
-| @heavy | `google/gemini-3-pro-preview` | 20x |
-
-### Routing modes
-
-Switch with `/budget <mode>`. Mode is persisted across restarts.
-
-| Mode | Default tier | Behavior |
-|------|-------------|----------|
-| `normal` | @medium | Balanced — routes by task complexity |
-| `budget` | @fast | Aggressive savings — defaults cheap, escalates only when necessary |
-| `quality` | @medium | Quality-first — liberal use of @medium/@heavy |
-| `deep` | @heavy | Deep-analysis mode — heavy-first for architecture/debug/security with longer heavy runs |
-
-```json
-{
-  "modes": {
-    "budget": {
-      "defaultTier": "fast",
-      "description": "Aggressive cost savings",
-      "overrideRules": [
-        "default→@fast unless edits/complex-reasoning needed",
-        "@medium ONLY: multi-file-edit/refactor/test-suite/build-fix",
-        "@heavy ONLY: user-requested OR ≥2 @medium failures"
-      ]
-    },
-    "deep": {
-      "defaultTier": "heavy",
-      "description": "Deep analysis mode — prioritizes thorough architecture/debug work with long heavy runs",
-      "overrideRules": [
-        "default→@medium for implementation and multi-file changes",
-        "@heavy for architecture/debug/security/tradeoff-analysis by default",
-        "allow long heavy runs before fallback; avoid premature downshift",
-        "trivial(grep/read/glob)→direct,no-delegate",
-        "if task is composite and phases are separable: prefer explore@fast then execute@heavy"
-      ]
-    }
-  }
-}
-```
-
-**Heavy tool-call budget:** `@heavy.steps=120` by default across presets (raised from 60) to reduce premature cutoffs on long architecture/debug tasks.
-
-### Task taxonomy (`taskPatterns`)
-
-Keyword routing guide injected into the system prompt. Customize to match your workflow:
-
-```json
-{
-  "taskPatterns": {
-    "fast": ["search/grep/read", "git-info/ls", "lookup-docs/types", "count/exists-check/rename"],
-    "medium": ["impl-feature/refactor", "write-tests/bugfix(≤2)", "build-fix/create-file"],
-    "heavy": ["arch-design/debug(≥3fail)", "sec-audit/perf-opt", "migrate-strategy/rca"]
-  }
-}
-```
-
-### Cost ratios
-
-Set `costRatio` on each tier to reflect your real provider pricing. These are injected into the system prompt so the orchestrator makes cost-aware decisions:
-
-```json
-{
-  "fast":   { "costRatio": 1  },
-  "medium": { "costRatio": 5  },
-  "heavy":  { "costRatio": 20 }
-}
-```
-
-Adjust to actual prices. Exact values don't matter — directional signals are enough.
-
-### Rules
-
-The `rules` array is injected verbatim (in compact form) into the system prompt. Default ruleset:
-
-```json
-{
-  "rules": [
-    "[tier:X]→delegate X",
-    "plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy",
-    "default preference: read-only work → @fast; implementation → @medium",
-    "orchestrate=self,delegate=exec",
-    "trivial (≤1 tool call, no expected follow-up) → direct, skip-delegate",
-    "before dispatching @heavy: gather context first (usually via @fast); if context is already sufficient, dispatch directly",
-    "if self is opus: skip-@heavy (do locally); still prefer routing broader read-only exploration to @fast",
-    "min(cost,adequate-tier)"
-  ]
-}
-```
-
-Rules in `modes[x].overrideRules` replace this array entirely for that mode.
-
-### Read-only call caps
-
-Subagents carry a cap on their own read-only tool calls (grep/read/glob/ls) per dispatch. Enforcement is **two-layered**: prompt-level stop rules + runtime banners injected into tool results. Baselines (configurable via `tierCaps` — see below):
-
-| Tier | Baseline cap | Orchestrator self-cap |
-|------|-------------:|----------------------:|
-| `@fast` | 8 | — |
-| `@medium` | 5 | — |
-| `@heavy` | 3 | — |
-| Orchestrator (direct tools) | — | 2 per turn (prompt-level only) |
-
-The orchestrator can override any subagent's cap per dispatch by including a directive in the `Task` prompt:
-
-- `CAP:N` — tighten or loosen to N calls (e.g., `CAP:3` for a focused lookup).
-- `CAP:none` — disable the numeric cap entirely (used in `quality` mode and for `@heavy` in `deep` mode).
-
-Omitting the directive falls back to the tier baseline. Subagents may **exceed** their cap with a 1-line `reason:` in the return (target, not hard block).
-
-#### Runtime enforcement (subagents only)
-
-Prompt-level rules alone are unreliable: many models (including strong ones like Opus 4.7) ignore "please stop at N reads" and loop on reconnaissance for tens of minutes. To address this, the plugin tracks read-only tool calls per subagent session and **appends a banner to every read-only tool result** via the `tool.execute.after` hook. The subagent sees this banner inside the tool's own response text — not as advisory system prompt noise — which makes it very hard to ignore.
-
-What the subagent sees inside each `grep`/`read`/`glob`/`ls` result:
-
-```
-...normal tool output...
-
-[cap: 3/5]
-```
-
-Approaching or hitting the cap:
-
-```
-[cap: 4/5]
+[cap: 4/8]
 [⚠ CAP WARNING: 1 read-only call(s) remaining before forced return]
 ```
 
+Redundant repeats get flagged (`[⚠ REDUNDANT: this is the same grep you ran at call #1. STOP…]`), and in `enforced` mode the PreToolUse guard **hard-denies** the call outright. Counters live on disk keyed by subagent session, so they survive across hook processes.
+
+**Deterministic acceptance checks.**
+Delegations that carry an `[acceptance]` block are verified after the subagent returns: `testsPass`, `buildPasses`, `lintClean`, `fileExists`, `run command="…" expect="…"`, `schemaMatch`. Failures surface a forcing note naming the next tier on the escalation ladder.
+
+**Four routing modes.**
+`/budget normal|budget|quality|deep` — balanced, aggressive savings (defaults cheap), quality-first, or heavy-first for long architecture/debug runs. Mode persists across restarts and re-shapes the injected protocol immediately.
+
+**Plan annotation.**
+`/annotate-plan [path]` tags each plan step with `[tier:fast|medium|heavy]` (+ `[acceptance]` blocks), removing routing ambiguity from multi-step work.
+
+## How it works
+
 ```
-[cap: 5/5]
-[⚠ CAP REACHED (5/5): your NEXT response MUST be a return — do NOT make another read-only call. Start the response with DONE:, NEED MORE:, NEED CONTEXT:, SCOPE GROWTH:, or ESCALATE:.]
+UserPromptSubmit ──► inject delegation protocol (every message)
+                      │
+Orchestrator decides ─┬─ read-only work ───► Agent(subagent_type="fast")
+                      ├─ implementation ───► Agent(subagent_type="medium")
+                      └─ arch/debug/sec ───► Agent(subagent_type="heavy")
+                      │
+PreToolUse  (Read|Grep|Glob|LS)  guard: deny at cap / on repeat (enforced mode)
+PostToolUse (Read|Grep|Glob|LS)  banner: [cap: N/MAX] / ⚠ REDUNDANT / ⚠ CAP REACHED
+PostToolUse (Task|Agent)         deterministic DoD verification + forcing note
+Stop                             narration detection (post-hoc banner)
 ```
 
-Redundancy (same file re-read, same `grep` pattern re-run):
+- Subagent sessions are detected via the hook payload's `agent_type`; cap state lives in `~/.zcode/model-router/caps/<session_id>.json`.
+- Orchestrator self-cap: ≤2 direct read-only calls per turn (advisory nudge past that; never blocked).
+- State (`preset` / `mode` / `enforcement` / `bypass`) persists in `~/.zcode/model-router/state.json`.
 
+### Enforcement modes
+
+| Mode | Behavior |
+|------|----------|
+| `off` | All router hooks no-op — byte-for-byte unchanged sessions |
+| `advisory` *(default)* | Banners + forcing notes, nothing blocked |
+| `enforced` | Guard hard-denies subagent read-only calls that breach cap/redundancy policy |
+
+Switch at runtime: `/router enforce <off|advisory|enforced>`, or force per-session with `MODEL_ROUTER_ENFORCE=0|1`.
+
+### Known limitations vs the opencode original
+
+- **No grader dispatch / runtime escalation loop.** zcode exposes no programmatic session API, so Layer-2 verification is deterministic-checks-only and the escalation ladder is advisory (the forcing note names the next tier; the orchestrator re-dispatches).
+- **No cross-provider fallback chains.** Models are static per agent file; `/preset` + `npm run sync-agents` regenerates them.
+- **Per-dispatch `CAP:N` overrides are prompt-level only.** Hook payloads don't link child sessions to dispatch prompts, so the runtime enforces per-tier baselines from `tierCaps`; `CAP:N`/`CAP:none` in a dispatch prompt still steer the subagent itself.
+
+## Installation
+
+zcode loads plugins from marketplaces, and a local directory works as one:
+
+1. **Add the marketplace**: zcode → Settings → Plugin Management → Discover → `+` → add this repository's local path.
+2. **Install** the `zcode-model-router` plugin from it.
+3. **Verify**: agent files are committed, but after editing `tiers.json` run:
+
+```bash
+npm install        # dev only, for the test suite
+npm run sync-agents
+npm test
 ```
-[cap: 3/5]
-[⚠ REDUNDANT: this is the same grep you ran at call #1. STOP now — repeated reads add no information. Return with DONE/NEED MORE/NEED CONTEXT/SCOPE GROWTH/ESCALATE.]
-```
 
-The orchestrator session is **not tracked** — its self-cap of 2 direct reads per turn is prompt-only. Tool counting applies only to sessions whose `agent` matches a registered tier name.
+Restart your zcode session (or open a new one) so the plugin's agents, hooks, and commands load.
 
-#### Configuring caps (`tierCaps`)
+## Configuration
+
+Everything lives in `tiers.json` at the plugin root.
+
+### Presets
+
+`presets.<name>.{fast,medium,heavy}` each carry `model`, optional `thoughtLevel` (reasoning variant — must be one of the model's supported levels, e.g. `high`/`max` for GLM-5.3), `costRatio`, `maxTurns`, `tools`, `color`, `description`, `whenToUse`. Switch with `/preset <name>`, then run `npm run sync-agents` and restart.
+
+### Read-only caps
 
 ```json
-{
-  "tierCaps": {
-    "fast": 8,
-    "medium": 5,
-    "heavy": 3
-  }
-}
+{ "tierCaps": { "fast": 8, "medium": 5, "heavy": 3 } }
 ```
 
-Values are positive integers. Missing tier → falls back to the hardcoded default (same numbers). Change these to tighten/loosen the baseline without editing any prompt.
+Enforced at runtime via the guard/banner hooks; orchestrator self-cap is 2 direct reads per turn.
 
-#### Return protocol
+### Task taxonomy / rules / modes
 
-Independent of the numeric cap, every subagent runs a redundancy check before each new tool call. On stop (cap reached, redundancy detected, scope satisfied, or runtime banner), the subagent returns with exactly one of:
+`taskPatterns` (keyword routing guide), `rules` (compact numbered rules), `modes` (normal/budget/quality/deep with optional `overrideRules` that replace the global ruleset in that mode) — all injected into the delegation protocol. `tierPrompts` holds the subagent system prompts rendered into `agents/*.md` by `sync-agents`.
 
-| Return prefix | Meaning |
-|--------------|---------|
-| `DONE: …` | Dispatch request fully satisfied — synthesize into final answer. |
-| `NEED MORE: …` (or `NEED CONTEXT:` for `@medium`, `SCOPE GROWTH:` for `@heavy`) | Subagent needs another targeted round — orchestrator decides what to dispatch. |
-| `ESCALATE: …` | Scope grew beyond the subagent's role — orchestrator re-routes. |
-
-This keeps subagents from burning tokens on repeated lookups when they already have enough context. `CAP:none` lifts the numeric cap but **does not** disable the redundancy check — the runtime still injects `[⚠ REDUNDANT]` banners regardless of cap setting.
-
-**Mode interactions:**
-
-| Mode | Dispatch directive | Orchestrator self-cap |
-|------|-------------------|-----------------------|
-| `normal` | baselines (omit directive) | ≤2 direct reads |
-| `budget` | `CAP:5` @fast, `CAP:2` @medium, `CAP:2` @heavy | ≤1 direct read |
-| `quality` | `CAP:none` on all dispatches | ≤2 direct reads |
-| `deep` | `CAP:none` on `@heavy` only; baselines elsewhere | ≤2 direct reads |
-
-### Tier prompts (`tierPrompts`)
-
-Each tier (`@fast`, `@medium`, `@heavy`) has a system prompt that describes its role, scope, call cap, and return protocol. To avoid duplicating the same string across every preset, the router uses a **global default with per-tier override**:
+### Verification defaults
 
 ```json
-{
-  "tierPrompts": {
-    "fast":   "You are @fast — ... (full global prompt)",
-    "medium": "You are @medium — ...",
-    "heavy":  "You are @heavy — ..."
-  },
-  "presets": {
-    "anthropic": {
-      "fast":   { "model": "anthropic/claude-haiku-4-5", ... },
-      "medium": { "model": "anthropic/claude-sonnet-4-6", ... },
-      "heavy":  { "model": "anthropic/claude-opus-4-7", ... }
-    }
-  }
-}
+{ "verifyDefaults": { "testCommand": "npm test", "buildCommand": "npm run build", "lintCommand": "npm run lint" } }
 ```
 
-**Resolution order per tier:**
-
-1. If the preset's tier defines `"prompt": "..."` inline → use it (per-tier override).
-2. Otherwise → fall back to `tierPrompts[<tierName>]`.
-3. If neither is set → the tier registers without a system prompt.
-
-**When to customize:** if a specific provider/model in a preset needs different instructions (e.g. Gemini-specific tool format, tighter/looser caps for a weaker local model), add `"prompt": "..."` on that tier only. All other presets keep using the global.
-
-```json
-{
-  "presets": {
-    "google": {
-      "fast": {
-        "model": "google/gemini-2.5-flash",
-        "prompt": "You are @fast (Gemini-tuned variant) — ...",
-        ...
-      }
-    }
-  }
-}
-```
-
-### Claude-model adversarial prefixes (automatic)
-
-Anthropic models (served directly via `anthropic/*` or routed through other providers as `*/claude-*`) ship with a large cached system prompt that primes them toward broad exploratory Read/Grep/Glob behavior. When such a prompt sits in front of your router instructions, primacy bias and prompt caching weaken the router's authority — subagents ignore caps, orchestrators run read-only work themselves instead of dispatching.
-
-To counteract this, the router **automatically prepends an adversarial opener** to:
-
-- The tier prompt for any tier whose `model` matches a Claude identifier
-- The orchestrator delegation protocol when the session model is a Claude identifier
-
-Detection is by model string, not preset. A `hybrid` preset that mixes providers (e.g. `openai/*` for @fast, `anthropic/*` for @medium and @heavy) gets the override only on its Claude-backed tiers.
-
-**Tone assignment:**
-
-| Target | Tone | Opener label |
-|--------|------|--------------|
-| `@fast` (Claude) | Scoping — conversational | `SCOPE NOTE` |
-| `@medium` (Claude) | Scoping — conversational | `SCOPE NOTE` |
-| `@heavy` (Claude) | Override — firm | `AUTHORITY OVERRIDE` |
-| Orchestrator (Claude) | Override — firm | `AUTHORITY OVERRIDE` |
-
-`@heavy` and the orchestrator use the firmer tone because that's where reconnaissance loops were worst in observed sessions. `@fast` and `@medium` use a softer scoping note to avoid over-correcting legitimate multi-read tasks.
-
-**Detection rules:**
-
-- `anthropic/<anything>` → Claude
-- `<provider>/claude-<anything>` (e.g. `github-copilot/claude-sonnet-4-6`) → Claude
-- `<provider>/<namespace>.claude-<anything>` (e.g. `bedrock/us.anthropic.claude-3-5-sonnet-...`) → Claude
-- Everything else → untouched
-
-No configuration is needed — the prefixes are always applied for Claude-backed tiers. If you want to disable them, override the tier's `prompt` field (per-tier overrides replace the whole prompt, including the prefix).
-
-### Anti-narration guardrail (Claude models)
-
-Thinking-enabled Claude models (especially Sonnet with the `max` variant) sometimes produce progress narration instead of actual work — phrasings like *"Still writing the X function..."*, *"Now I'll implement Y..."*, *"Let me add Z..."* — without the X/Y/Z ever appearing. This is a known thinking-mode failure pattern.
-
-The router counters this on two layers:
-
-**1. Prompt-level clause (prevention).** A dedicated `ANTI-NARRATION` block is appended to every Claude-backed tier prompt and to the Claude-backed orchestrator delegation protocol. It names the forbidden phrasings explicitly and requires concrete output to follow any such phrase. A carve-out preserves legitimate explanation/plan requests from the user.
-
-**2. Post-hoc detector (telemetry).** An `experimental.text.complete` hook scans completed text for narration regex patterns. On match, it:
-
-- Logs a warning to the plugin console:
-  ```
-  [model-router] narration detected (session abc123): "Still writing the auth", "Now I'll add the tests"
-  ```
-- Appends a visible banner to the text as it's rendered to the user:
-  ```
-  [⚠ narration detected: "Still writing the auth", "Now I'll add the tests"]
-  ```
-
-The detector is not blocking — plugin hooks cannot modify tokens mid-stream. It signals post-hoc so you can spot the pattern in the UI and in logs, and judge whether the prompt-level clause is holding up.
-
-Detected patterns (conservative set to minimize false positives):
-
-- `Still (writing|implementing|working on|...) the X`
-- `Now (I'll)? (write|implement|add|...) the X`
-- `Let me (write|implement|add|...) (the )? X`
-- `I'll (now)? (write|implement|...) the X`
-- `Going to (write|implement|...) the X`
-- `Continuing (with|by ...ing) (the )? X`
-
-Applies to all models, not only Claude — but the prompt-level clause is Claude-only, so non-Claude models get detector-only.
-
-### Tier fields reference
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | string | Full model ID (`provider/model-name`) |
-| `variant` | string | Optional variant (`"max"`, `"xhigh"`, `"thinking"`) |
-| `costRatio` | number | Relative cost (1 = cheapest). Shown in prompt. |
-| `thinking` | object | Anthropic thinking: `{ "budgetTokens": 10000 }` |
-| `reasoning` | object | OpenAI reasoning: `{ "effort": "high", "summary": "detailed" }` |
-| `description` | string | Shown in `/tiers` output |
-| `steps` | number | Max agent turns |
-| `prompt` | string | Optional per-tier system prompt override. Falls back to top-level `tierPrompts[<tierName>]` when omitted. |
-| `whenToUse` | string[] | Use cases (shown in `/tiers`, not in system prompt) |
-
-### Fallback
-
-Defines provider fallback order when a delegated task fails:
-
-```json
-{
-  "fallback": {
-    "global": {
-      "anthropic": ["openai", "google", "github-copilot"],
-      "openai": ["anthropic", "google", "github-copilot"]
-    }
-  }
-}
-```
-
-## Delegation enforcement (advisory by default)
-
-The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with independent acceptance and quality escalation. As of v1.3.0 it runs in **`advisory` mode by default**: every non-trivial delegation is verified and any miss surfaces a forcing-note, but nothing is ever hard-blocked (the orchestrator system prompt grows by ~200 tokens for the DoD/acceptance section, and subagents may receive non-blocking guard banners). Set `"mode": "off"` — or run `/router enforce off` — to restore byte-for-byte-unchanged routing with zero added prompt tokens and zero new latency. Hard-blocks only activate in `"mode": "enforced"`.
-
-### The three enforcement layers
-
-- **Layer 1 — hard-block guard.** A `tool.execute.before` hook throws before a disallowed tool call executes, stopping budget overruns, redundant reads, and throwaway-script sidesteps in subagent sessions.
-- **Layer 2 — independent acceptance gate.** Every non-trivial delegation carries a Definition-of-Done (DoD) that is checked — deterministically or by an independent grader at ≥ the producer's tier — before the result is trusted. The producer never grades its own output.
-- **Layer 3 — quality-escalation ladder.** On a failed check: retry once, then escalate fast → medium → heavy, bounded by attempt and cost ceilings. The loop ends in an honest `status: unmet` rather than a fabricated pass.
-
-### Two operating modes
-
-- **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed and verified automatically by the enforcement pipeline, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
-- **Mode B — plan-annotated.** `/annotate-plan` emits `[tier:X]` plus an `[acceptance]` block per task; the enforcement loop is wired up at execution time based on those annotations.
-
-### Tuning enforcement
-
-Advisory is the default. To change the level:
-
-1. Add or edit the `enforcement` block in `tiers.json` — `"mode": "off"`, `"advisory"`, or `"enforced"` (see `docs/CONFIG_REFERENCE.md`).
-2. Set `MODEL_ROUTER_ENFORCE=1` to force `enforced` for a session, or `MODEL_ROUTER_ENFORCE=0` to force `off`.
-3. Run `/router enforce <off|advisory|enforced>` from the chat to toggle at runtime.
-
-**Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
-
-> Enforcement applies to subagent/delegate sessions only. The orchestrator session is never hard-blocked.
-
-### Deep-dive documentation
-
-- `docs/ENFORCEMENT.md` — architecture, hook wiring, session lifecycle
-- `docs/VERIFICATION.md` — DoD schema, deterministic checks, grader dispatch
-- `docs/ESCALATION.md` — escalation ladder configuration and cost ceilings
-- `docs/CONFIG_REFERENCE.md` — full `enforcement` block schema
-- `docs/ENFORCEMENT_PRESETS.md` — ready-to-paste enforcement presets
-
-> These files are not included in the npm tarball. This section is the self-contained summary; the docs are available in the repository for contributors and advanced users.
+Used by `testsPass`/`buildPasses`/`lintClean` checks that don't carry an explicit `command=`.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/tiers` | Show active tier configuration, models, and rules |
-| `/preset` | List available presets |
-| `/preset <name>` | Switch preset (e.g., `/preset openai`) |
-| `/budget` | Show available modes and which is active |
-| `/budget <mode>` | Switch routing mode (`normal`, `budget`, `quality`, `deep`) |
-| `/annotate-plan [path]` | Annotate a plan file with `[tier:X]` tags for each step |
+| `/tiers` | Show active tiers, models, caps, and rules |
+| `/preset [name]` | List or switch presets |
+| `/budget [mode]` | List or switch routing mode (`normal`, `budget`, `quality`, `deep`) |
+| `/router [enforce <mode>]` | Status or enforcement level |
+| `/bypass [on\|off]` | Toggle the router off entirely |
+| `/annotate-plan [path]` | Tag a plan with `[tier:X]` + `[acceptance]` blocks |
 
-## Plan annotation
+## Cost intuition
 
-For complex tasks, you can write a plan file and annotate each step with the correct tier. The `/annotate-plan` command reads the plan and adds `[tier:fast]`, `[tier:medium]`, or `[tier:heavy]` tags to each step based on the task taxonomy.
+Same math as the opencode original, mapped to the GLM stack: a session where ~60% of work is exploration runs that exploration at 1x instead of your orchestrator's rate, implementation lands on the mid tier, and only genuine architecture/debug burns the 20x tier. Composite tasks ("find how auth works, then refactor it") split into `@fast` explore + `@medium` execute — the single biggest saving on everyday work.
 
-The orchestrator then reads these tags and delegates accordingly — removing ambiguity from routing decisions on long, multi-step tasks.
+## Development
 
-Example plan (before annotation):
-```markdown
-1. Find all API endpoints in the codebase
-2. Add rate limiting middleware to each endpoint
-3. Write integration tests for rate limiting
-4. Design a token bucket algorithm for advanced rate limiting
+```bash
+npm test          # unit (lib modules) + contract (spawn hook scripts, assert strict stdout JSON)
+npm run sync-agents
 ```
 
-After `/annotate-plan`:
-```markdown
-1. [tier:fast] Find all API endpoints in the codebase
-2. [tier:medium] Add rate limiting middleware to each endpoint
-3. [tier:medium] Write integration tests for rate limiting
-4. [tier:heavy] Design a token bucket algorithm for advanced rate limiting
+Layout:
+
 ```
-
-## Token overhead
-
-The system prompt injection is ~210 tokens per message — roughly the same as v1.0 (before cost-aware features were added). Dense notation keeps overhead flat while adding full routing intelligence.
-
-| Version | Tokens | Features |
-|---------|--------|----------|
-| v1.0.7 | ~208 | Basic tier routing |
-| v1.1.0 | ~870 | All features, verbose format |
-| v1.1.1+ | ~210 | All features, compressed format |
-
-## Requirements
-
-- [OpenCode](https://opencode.ai) v1.0 or later
-- Node.js 18+
-- Provider API keys configured in OpenCode
+.zcode-plugin/plugin.json    manifest
+agents/*.md                  generated subagent definitions (fast/medium/heavy)
+hooks/hooks.json             hook registrations (6 entries)
+hooks/scripts/*.mjs          hook entry points + cli backend
+hooks/scripts/lib/*.mjs      pure logic (protocol, caps, dod, deterministic, enforce, …)
+commands/*.md                /tiers /preset /budget /bypass /router /annotate-plan
+scripts/sync-agents.mjs      renders agents/ from tiers.json
+test/unit, test/contract     vitest suites
+```
 
 ## License
 

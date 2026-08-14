@@ -1,0 +1,28 @@
+{
+  "name": "zcode-model-router",
+  "owner": {
+    "name": "Marvin Chin Yi Kai"
+  },
+  "metadata": {
+    "description": "Smart subagent model routing for zcode — routes coding tasks to tiered subagents (fast/medium/heavy) by cost"
+  },
+  "plugins": [
+    {
+      "name": "zcode-model-router",
+      "source": "./",
+      "description": "Routes every coding task to the right-priced tier automatically: delegation protocol injection, runtime read-only cap enforcement, deterministic acceptance checks. GLM tier presets (GLM-4.7 / GLM-5.3 high / GLM-5.3 max).",
+      "version": "2.0.0",
+      "author": {
+        "name": "Marvin Chin Yi Kai"
+      },
+      "license": "GPL-3.0-only",
+      "keywords": [
+        "model-routing",
+        "subagents",
+        "delegation",
+        "cost-optimization",
+        "orchestration"
+      ]
+    }
+  ]
+}

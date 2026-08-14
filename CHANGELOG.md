@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0]
+
+Complete adaptation from an OpenCode plugin to a zcode plugin (Claude Code-compatible plugin architecture). The `@opencode-ai/plugin` TypeScript codebase is replaced by dependency-free ESM hook scripts + static agent definitions.
+
+### Added
+- `.zcode-plugin/plugin.json` manifest; `agents/{fast,medium,heavy}.md` generated from `tiers.json` by `scripts/sync-agents.mjs` (frontmatter: `model`, `thoughtLevel`, `maxTurns`, `tools`).
+- `hooks/hooks.json`: UserPromptSubmit protocol injection, PreToolUse cap/redundancy guard (deny via `permissionDecision` in enforced mode), PostToolUse cap banners, PostToolUse deterministic DoD verification on `Task|Agent`, Stop narration detection, SessionStart cap-file GC.
+- Disk-backed cap state (`~/.zcode/model-router/caps/`) keyed by subagent session id — hooks are one-shot processes.
+- `zai` preset: GLM-4.7 / GLM-5.3 (high) / GLM-5.3 (max); `zai-turbo` alt preset (GLM-5-Turbo / GLM-5.2 / GLM-5.3 max).
+- Commands: `/tiers`, `/preset`, `/budget`, `/router enforce`, `/bypass`, `/annotate-plan` backed by `hooks/scripts/cli.mjs`.
+- Unit + contract test suites (vitest, 108 tests): lib modules in isolation, hook scripts spawned with fixture stdin asserting strict stdout JSON.
+
+### Changed
+- Delegation tool references rewritten from `Task(...)` to `Agent(subagent_type=...)`.
+- State moved to `~/.zcode/model-router/state.json`; `bypass` is now persisted.
+- Protocol injection moved from `chat.system.transform` to UserPromptSubmit `additionalContext`.
+
+### Removed
+- Grader dispatch, verified `delegate` tool, runtime escalation ladder, provider fallback chains (no programmatic session API in zcode; DoD verification is deterministic-only, escalation advisory).
+- OpenCode TS source, smoke tests, opencode-specific docs.
+
 ## [1.3.0]
 
 ### Changed — advisory enforcement is now the default

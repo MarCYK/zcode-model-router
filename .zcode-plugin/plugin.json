@@ -1,0 +1,21 @@
+{
+  "name": "zcode-model-router",
+  "version": "2.0.0",
+  "description": "zcode plugin that routes coding tasks to tiered subagents (fast/medium/heavy) by cost — delegation protocol, runtime cap enforcement, deterministic DoD verification",
+  "author": {
+    "name": "Marvin Chin Yi Kai"
+  },
+  "license": "GPL-3.0-only",
+  "agents": "./agents/",
+  "hooks": "./hooks/hooks.json",
+  "commands": "./commands/",
+  "keywords": [
+    "zcode",
+    "model-routing",
+    "subagents",
+    "delegation",
+    "multi-model",
+    "orchestration",
+    "cost-optimization"
+  ]
+}

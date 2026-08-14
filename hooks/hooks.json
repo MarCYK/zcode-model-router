@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start.mjs\"",
+            "timeout": 10
+          }
+        ],
+        "description": "model-router: GC stale cap-state files",
+        "id": "router:session-start:gc"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/protocol-inject.mjs\"",
+            "timeout": 10
+          }
+        ],
+        "description": "model-router: inject delegation protocol + reset turn reads",
+        "id": "router:prompt:protocol"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|LS",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/subagent-guard.mjs\"",
+            "timeout": 10
+          }
+        ],
+        "description": "model-router: cap/redundancy guard (deny in enforced mode)",
+        "id": "router:pre:guard"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|LS",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/cap-banner.mjs\"",
+            "timeout": 10
+          }
+        ],
+        "description": "model-router: [cap: N/MAX] / REDUNDANT banners for subagents",
+        "id": "router:post:cap-banner"
+      },
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/dispatch-verify.mjs\"",
+            "timeout": 150
+          }
+        ],
+        "description": "model-router: deterministic DoD verification on delegations",
+        "id": "router:post:dispatch-verify"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/narration-scan.mjs\"",
+            "timeout": 10
+          }
+        ],
+        "description": "model-router: post-hoc narration detection",
+        "id": "router:stop:narration"
+      }
+    ]
+  }
+}
