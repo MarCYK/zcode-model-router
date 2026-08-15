@@ -11,7 +11,7 @@
       "name": "zcode-model-router",
       "source": "./",
       "description": "Routes every coding task to the right-priced tier automatically: delegation protocol injection, runtime read-only cap enforcement, deterministic acceptance checks. GLM tier presets (GLM-4.7-Flash / GLM-5.3 high / GLM-5.3 max).",
-      "version": "2.0.0",
+      "version": "2.0.1",
       "author": {
         "name": "Marvin Chin Yi Kai"
       },
