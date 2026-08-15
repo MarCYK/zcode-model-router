@@ -68,7 +68,7 @@ describe("protocol-inject (UserPromptSubmit)", () => {
     expect(out.hookEventName).toBe("UserPromptSubmit");
     expect(out.additionalContext).toContain("Model Delegation Protocol");
     expect(out.additionalContext).toContain('Agent(subagent_type="fast"');
-    expect(out.additionalContext).toContain("@fast=GLM-4.7(1x)");
+    expect(out.additionalContext).toContain("@fast=GLM-4.7-Flash(1x)");
   });
 
   it("resets the orchestrator turn counter", () => {

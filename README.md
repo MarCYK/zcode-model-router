@@ -21,11 +21,11 @@ Three subagents ship out of the box (`fast` / `medium` / `heavy`), each a static
 
 | Tier | Model | Reasoning | Cost ratio | Read-only cap |
 |------|-------|-----------|-----------:|--------------:|
-| `@fast` | GLM-4.7 | — | 1x | 8 |
+| `@fast` | GLM-4.7-Flash | — | 1x | 8 |
 | `@medium` | GLM-5.3 | high | 5x | 5 |
 | `@heavy` | GLM-5.3 | max | 20x | 3 |
 
-> GLM-4.7 not available on your plan? Switch to the `zai-turbo` preset (`GLM-5-Turbo` / `GLM-5.2` / `GLM-5.3 max`) with `/preset zai-turbo` + `npm run sync-agents`.
+> GLM-4.7-Flash not available on your plan? Switch to the `zai-turbo` preset (`GLM-4.7` / `GLM-5.2` / `GLM-5.3 max`) with `/preset zai-turbo` + `npm run sync-agents`.
 
 **Runtime cap enforcement (not just prompt rules).**
 Prompt-only caps get ignored. So the router *observes* every read-only tool call a subagent makes (PostToolUse hook) and injects a live counter into its context:

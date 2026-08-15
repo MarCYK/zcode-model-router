@@ -23,10 +23,10 @@
   "presets": {
     "zai": {
       "fast": {
-        "model": "GLM-4.7",
+        "model": "GLM-4.7-Flash",
         "costRatio": 1,
         "color": "green",
-        "description": "GLM-4.7 for read-only exploration, search, and simple lookups",
+        "description": "GLM-4.7-Flash for read-only exploration, search, and simple lookups",
         "maxTurns": 30,
         "tools": ["Read", "Grep", "Glob", "Bash"],
         "whenToUse": [
