@@ -13,7 +13,7 @@ Complete adaptation from an OpenCode plugin to a zcode plugin (Claude Code-compa
 - `.zcode-plugin/plugin.json` manifest; `agents/{fast,medium,heavy}.md` generated from `tiers.json` by `scripts/sync-agents.mjs` (frontmatter: `model`, `thoughtLevel`, `maxTurns`, `tools`).
 - `hooks/hooks.json`: UserPromptSubmit protocol injection, PreToolUse cap/redundancy guard (deny via `permissionDecision` in enforced mode), PostToolUse cap banners, PostToolUse deterministic DoD verification on `Task|Agent`, Stop narration detection, SessionStart cap-file GC.
 - Disk-backed cap state (`~/.zcode/model-router/caps/`) keyed by subagent session id — hooks are one-shot processes.
-- `zai` preset: GLM-4.7 / GLM-5.3 (high) / GLM-5.3 (max); `zai-turbo` alt preset (GLM-5-Turbo / GLM-5.2 / GLM-5.3 max).
+- `zai` preset: GLM-4.7-Flash / GLM-5.3 (high) / GLM-5.3 (max); `zai-turbo` alt preset (GLM-5-Turbo / GLM-5.2 / GLM-5.3 max).
 - Commands: `/tiers`, `/preset`, `/budget`, `/router enforce`, `/bypass`, `/annotate-plan` backed by `hooks/scripts/cli.mjs`.
 - Unit + contract test suites (vitest, 108 tests): lib modules in isolation, hook scripts spawned with fixture stdin asserting strict stdout JSON.
 
