@@ -41,6 +41,13 @@ function frontmatterValue(v) {
   return v.join(", ");
 }
 
+// tiers.json model ids are provider-qualified ("zai/GLM-4.7-Flash") for the
+// upstream router's parseModelRef validation; zcode agent frontmatter needs
+// the bare model id.
+function bareModel(model) {
+  return model.split("/").pop() ?? model;
+}
+
 function renderAgent(tierName, tier) {
   const prompt =
     tier.prompt ??
@@ -55,12 +62,13 @@ function renderAgent(tierName, tier) {
   const inner = claudePrefix ? `${claudePrefix}\n\n---\n\n${prompt}` : prompt;
   const body = `${BODY_HEADER}\n\n${inner}`;
 
+  const modelId = bareModel(tier.model);
   const fm = [
     "---",
     `name: ${tierName}`,
     `description: ${tier.description} Use PROACTIVELY per the Model Delegation Protocol when a dispatch matches: ${tier.whenToUse.join("; ")}.`,
     tier.tools ? `tools: ${frontmatterValue(tier.tools)}` : null,
-    `model: ${tier.model}`,
+    `model: ${modelId}`,
     tier.thoughtLevel ? `thoughtLevel: ${tier.thoughtLevel}` : null,
     tier.maxTurns ? `maxTurns: ${tier.maxTurns}` : null,
     tier.color ? `color: ${tier.color}` : null,
@@ -77,7 +85,7 @@ for (const [tierName, tier] of Object.entries(preset)) {
   const out = renderAgent(tierName, tier);
   writeFileSync(join(root, "agents", `${tierName}.md`), out, "utf-8");
   console.log(
-    `wrote agents/${tierName}.md  (model=${tier.model}${tier.thoughtLevel ? ` thoughtLevel=${tier.thoughtLevel}` : ""})`,
+    `wrote agents/${tierName}.md  (model=${bareModel(tier.model)}${tier.thoughtLevel ? ` thoughtLevel=${tier.thoughtLevel}` : ""})`,
   );
 }
 console.log(`\nDone. Restart your zcode session (or open a new one) for the regenerated subagents to load.`);

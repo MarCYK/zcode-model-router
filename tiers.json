@@ -1,34 +1,61 @@
 {
   "activePreset": "zai",
   "activeMode": "normal",
+  "enforcement": {
+    "mode": "advisory",
+    "envGate": "MODEL_ROUTER_ENFORCE",
+    "guard": {
+      "budget": 25,
+      "readDraftCap": 3,
+      "sameOpRetryCap": 1,
+      "blockSelfScript": true,
+      "deliverableFirst": true,
+      "blockScriptWrites": false
+    },
+    "verify": {
+      "minGraderTier": null,
+      "graderTemperature": 0,
+      "requireExplicitDoD": false,
+      "delegateTimeoutMs": 600000,
+      "graderTimeoutMs": 60000
+    },
+    "escalate": {
+      "ladder": [
+        "fast",
+        "medium",
+        "heavy"
+      ],
+      "floorTier": null,
+      "maxAttemptsPerTier": 1,
+      "maxTotalAttempts": 4,
+      "costCeiling": {
+        "multiple": 4
+      }
+    },
+    "proportional": {
+      "trivialBypass": true
+    }
+  },
   "tierCaps": {
     "fast": 8,
     "medium": 5,
     "heavy": 3
   },
-  "verifyDefaults": {
-    "testCommand": "npm test",
-    "buildCommand": "npm run build",
-    "lintCommand": "npm run lint"
-  },
-  "enforcement": {
-    "mode": "advisory",
-    "verify": {
-      "require": "whenDoDPresent"
-    },
-    "escalate": {
-      "ladder": ["fast", "medium", "heavy"]
-    }
+  "tierPrompts": {
+    "fast": "STOP CONDITIONS — read these FIRST, they govern EVERY tool call:\n\n1. CAP: ≤8 read-only tool calls (grep/read/glob/ls) per dispatch. If the dispatch prompt contains `CAP:N`, N is your cap; `CAP:none` removes the numeric cap, but only when the dispatch also carries a `reason:` line — an unjustified `CAP:none` falls back to the baseline. The opencode runtime tracks your count and appends `[cap: N/MAX]` to every read-only tool result — that's your LIVE COUNTER. When N=MAX, your next action MUST be a return, not another read.\n\n2. REDUNDANCY: before every new read/grep/glob, ask yourself: \"Am I re-reading the same region or re-running a similar search I already ran?\" The runtime ALSO detects this and appends `[⚠ REDUNDANT]` to your tool result when you repeat a call. When you see that marker, stop repeating covered ground — repeated reads add nothing. A different region of the same file is not a repeat; the marker alone is not a reason to abandon the dispatch.\n\n3. RETURN PROTOCOL: on stop (cap reached or scope satisfied), return with EXACTLY ONE of these prefixes as the FIRST line of your response:\n   - `DONE: [one-line summary]` — the dispatch request is fully satisfied with what you have.\n   - `NEED MORE: [specific ask]` — you need the orchestrator to dispatch another targeted round.\n   - `ESCALATE: [reason]` — hand back for orchestrator to re-dispatch or decide.\n\n4. EXCEEDING CAP: only if the task is irreversibly incomplete AND returning with NEED MORE is worse than one more read. Prepend `reason: <1-line>` above your return. This should be rare.\n\n---\n\nROLE: You are @fast — a read-only exploration specialist. Scope: search, grep, read, ls, lookup, doc-lookup, type-check, count, exists-check, git-info. NEVER write, edit, or modify files. If the task requires edits, that is out of scope: report what needs changing and return. Return findings concisely: file:line paths, quoted snippets, and a one-line summary.\n\nPrefer a single focused pass; stop as soon as you have enough to answer the exact question asked. Do not explore beyond the asked scope. You execute this dispatch yourself: work within your scope and return findings.\n\nDirect tools (read, glob, grep, router_git_*) and the Code Mode catalog are separate; an empty Code Mode search does not mean a direct tool is missing. You cannot run a shell or edit files: report what you found, with file:line evidence, and say what a higher tier should do.",
+    "medium": "STOP CONDITIONS — read these FIRST, they govern EVERY read-only tool call BEFORE you begin editing:\n\n1. CAP: ≤5 read-only tool calls (grep/read/glob/ls) before you start editing. `CAP:N` in the dispatch overrides; `CAP:none` disables it, but only when the dispatch also carries a `reason:` line — an unjustified `CAP:none` falls back to the baseline. The opencode runtime tracks your reads and appends `[cap: N/MAX]` to every read-only tool result — that's your LIVE COUNTER. When N=MAX, start editing or return; do not make another read-only call.\n\n2. REDUNDANCY: before every new grep/read, ask: \"Did I already read this region or run a similar search?\" The runtime appends `[⚠ REDUNDANT]` to your tool result when you repeat a call. When you see that marker, stop repeating covered ground — repeated reads add nothing. A different region of the same file is not a repeat; the marker alone is not a reason to abandon the dispatch.\n\n3. RETURN PROTOCOL (when stopping before/instead of full implementation): first line of your response must be EXACTLY ONE of:\n   - `DONE: [summary of edits + verification]` — implementation complete.\n   - `NEED CONTEXT: [specific ask]` — requires orchestrator to dispatch @fast and re-invoke.\n   - `ESCALATE: [reason]` — scope grew beyond implementation (e.g. architectural decision needed).\n\n4. EXCEEDING CAP: only when the implementation genuinely requires more context. Prepend `reason: <1-line>` above your summary.\n\n---\n\nROLE: You are @medium — an implementation specialist. Scope: write/edit code, refactor, write tests, fix bugs, apply build-fixes, create files, config changes, API endpoints. Match existing project patterns exactly. Never suppress type errors (no `as any`, `@ts-ignore`, `@ts-expect-error`). Run targeted tests/linters for the changed area only — never the full suite unless asked. If you hit 2+ consecutive failures on the same issue, STOP and report back to the orchestrator with what you tried; do not self-escalate to @heavy. Return a concise summary: files changed, key decisions, tests added, verification run.\n\nYou execute this dispatch yourself rather than routing it to another tier. Avoid grep/read-exhaustive sweeps.\n\nBefore reporting progress, audit each claim against a tool result from this session. Only report work you can point to evidence for; if unverified, say so explicitly. If tests fail, report it with the relevant excerpt of the output.",
+    "heavy": "STOP CONDITIONS — read these FIRST, they govern EVERY tool call:\n\n1. CAP: ≤3 reads/greps per dispatch. `CAP:N` in the dispatch overrides; `CAP:none` disables it when the dispatch also carries a `reason:` line (used in `deep` mode). The opencode runtime tracks your count and appends `[cap: N/MAX]` to every read-only tool result — that's your LIVE COUNTER. You are an analysis specialist, not a reconnaissance specialist: at N=MAX, return your analysis based on what you have, or return `SCOPE GROWTH` asking for @fast pre-exploration.\n\n2. REDUNDANCY: before every new tool call, ask: \"Is this re-reading ground I've already covered or information already in my context?\" The runtime appends `[⚠ REDUNDANT]` to your tool result when you repeat a call. When you see that marker, stop repeating covered ground — repeated reads add nothing. A different region of the same file is not a repeat; the marker alone is not a reason to abandon the dispatch.\n\n3. RETURN PROTOCOL: first line of your response must be EXACTLY ONE of:\n   - `DONE: [structured analysis]` — request fully satisfied.\n   - `SCOPE GROWTH: prefer @fast pre-exploration of [specific files/patterns/areas] before I continue.` — orchestrator dispatches @fast and re-invokes you.\n   - `ESCALATE: [reason]` — hand back for orchestrator decision.\n\n4. EXCEEDING CAP: only when the analysis genuinely cannot be completed without one more read AND `SCOPE GROWTH` would be worse. Prepend `reason: <1-line>`.\n\n---\n\nROLE: You are @heavy — a senior architecture and debugging consultant. Scope: architecture decisions, security review, perf optimization, complex debugging (invoked after ≥2 prior failures), multi-system tradeoffs, migration strategy, root-cause analysis. Analyze exhaustively WITHIN the context you were given. Provide reasoning, tradeoffs, and concrete recommendations. Default to analysis + recommendations; write code only when the orchestrator explicitly asked for implementation. Return structured output: problem framing → options considered → tradeoffs → recommendation → implementation notes (if applicable).\n\nYou execute this dispatch yourself rather than routing it to another tier. Your job is analysis, not reconnaissance. 40 minutes of file reads is not analysis — it's reconnaissance. Stop early, analyze what you have, return SCOPE GROWTH if genuinely needed.\n\nBefore reporting progress, audit each claim against a tool result or the context you were given this session. Only report work you can point to evidence for; if unverified, say so explicitly. If tests fail, report it with the relevant excerpt of the output."
   },
   "presets": {
-    "zai": {
+    "anthropic": {
       "fast": {
-        "model": "GLM-4.7-Flash",
+        "readOnly": true,
+        "model": "anthropic/claude-haiku-5-5",
+        "variant": "low",
+        "effort": "low",
         "costRatio": 1,
-        "color": "green",
-        "description": "GLM-4.7-Flash for read-only exploration, search, and simple lookups",
-        "maxTurns": 30,
-        "tools": ["Read", "Grep", "Glob", "Bash"],
+        "description": "Haiku 5.5 low for exploration, search, and simple reads",
+        "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",
           "Simple file reads and listing",
@@ -37,13 +64,12 @@
         ]
       },
       "medium": {
-        "model": "GLM-5.3",
-        "thoughtLevel": "high",
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "medium",
+        "effort": "medium",
         "costRatio": 5,
-        "color": "yellow",
-        "description": "GLM-5.3 (high reasoning) for implementation, refactoring, and tests",
-        "maxTurns": 50,
-        "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write"],
+        "description": "Sonnet 5.5 medium for implementation, refactoring, and tests",
+        "steps": 50,
         "whenToUse": [
           "Feature implementation",
           "Refactoring",
@@ -53,13 +79,333 @@
         ]
       },
       "heavy": {
-        "model": "GLM-5.3",
-        "thoughtLevel": "max",
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
         "costRatio": 20,
-        "color": "red",
+        "description": "Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "openai": {
+      "fast": {
+        "readOnly": true,
+        "model": "openai/gpt-6-luna-fast",
+        "costRatio": 1,
+        "description": "GPT-6 Luna Fast for fast exploration and simple tasks",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads",
+          "Quick lookups"
+        ]
+      },
+      "medium": {
+        "model": "openai/gpt-6.1-sol-fast",
+        "variant": "xhigh",
+        "costRatio": 5,
+        "description": "GPT-6.1 Sol Fast (xhigh) for implementation and standard coding",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "openai/gpt-6-astra-fast",
+        "variant": "max",
+        "costRatio": 20,
+        "description": "GPT-6 Astra Fast (max) for architecture and complex tasks",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "github-copilot": {
+      "fast": {
+        "readOnly": true,
+        "model": "github-copilot/claude-haiku-4.5",
+        "costRatio": 1,
+        "description": "Claude Haiku 4.5 via GitHub Copilot for fast exploration and simple tasks",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "github-copilot/claude-sonnet-5",
+        "costRatio": 5,
+        "description": "Claude Sonnet 5 via GitHub Copilot for implementation, refactoring, and tests",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "github-copilot/claude-fable-5-1",
+        "costRatio": 20,
+        "description": "Claude Fable 5.1 via GitHub Copilot for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "google": {
+      "fast": {
+        "readOnly": true,
+        "model": "google/gemini-3.5-flash-lite",
+        "costRatio": 1,
+        "description": "Gemini 3.5 Flash Lite for fast exploration and simple tasks",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "google/gemini-3.7-flash",
+        "costRatio": 5,
+        "description": "Gemini 3.7 Flash for implementation, refactoring, and tests",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "google/gemini-3.1-pro-preview",
+        "costRatio": 20,
+        "description": "Gemini 3.1 Pro Preview for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "zai": {
+      "fast": {
+        "readOnly": true,
+        "model": "zai/GLM-4.7-Flash",
+        "costRatio": 1,
+        "description": "GLM-4.7-Flash for read-only exploration, search, and simple lookups",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ],
+        "maxTurns": 30,
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash"
+        ],
+        "color": "green"
+      },
+      "medium": {
+        "model": "zai/GLM-5.3",
+        "variant": "high",
+        "costRatio": 5,
+        "description": "GLM-5.3 (high reasoning) for implementation, refactoring, and tests",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Code review",
+          "Bug fixes"
+        ],
+        "maxTurns": 50,
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash",
+          "Edit",
+          "Write"
+        ],
+        "color": "yellow",
+        "thoughtLevel": "high"
+      },
+      "heavy": {
+        "model": "zai/GLM-5.3",
+        "variant": "max",
+        "costRatio": 20,
         "description": "GLM-5.3 (max reasoning) for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ],
         "maxTurns": 120,
-        "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write"],
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash",
+          "Edit",
+          "Write"
+        ],
+        "color": "red",
+        "thoughtLevel": "max"
+      }
+    },
+    "hybrid": {
+      "fast": {
+        "readOnly": true,
+        "model": "openai/gpt-6-luna-fast",
+        "variant": "medium",
+        "costRatio": 1,
+        "description": "GPT 6 Luna (medium) for exploration, search, and simple reads",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "openai/gpt-6-astra-fast",
+        "variant": "high",
+        "costRatio": 5,
+        "description": "GPT-6 Astra Fast (high) for implementation and standard coding",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
+        "costRatio": 20,
+        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "hybrid-2": {
+      "fast": {
+        "readOnly": true,
+        "model": "openai/gpt-6-luna-fast",
+        "variant": "medium",
+        "costRatio": 1,
+        "description": "GPT 6 Luna (medium) for exploration, search, and simple reads",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
+        "costRatio": 5,
+        "description": "Claude Sonnet (xhigh) for implementation and standard coding",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
+        "costRatio": 20,
+        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
+        "steps": 120,
+        "whenToUse": [
+          "Architecture decisions",
+          "Complex debugging (after 2+ failures)",
+          "Security review",
+          "Performance optimization"
+        ]
+      }
+    },
+    "fable-effort": {
+      "fast": {
+        "readOnly": true,
+        "model": "anthropic/claude-fable-5-1",
+        "effort": "low",
+        "costRatio": 1,
+        "description": "Fable 5 at low effort for exploration, search, and simple reads (token-spend ratios are estimates; same model across tiers preserves prompt cache)",
+        "steps": 30,
+        "whenToUse": [
+          "Codebase exploration and search",
+          "Simple file reads and listing",
+          "Grep/glob operations",
+          "Quick lookups and research"
+        ]
+      },
+      "medium": {
+        "model": "anthropic/claude-fable-5-1",
+        "effort": "high",
+        "costRatio": 3,
+        "description": "Fable 5 at high effort for implementation and standard coding (costRatio is an estimated token-spend multiplier, not a price difference)",
+        "steps": 50,
+        "whenToUse": [
+          "Feature implementation",
+          "Refactoring",
+          "Writing tests",
+          "Bug fixes"
+        ]
+      },
+      "heavy": {
+        "model": "anthropic/claude-fable-5-1",
+        "effort": "xhigh",
+        "costRatio": 6,
+        "description": "Fable 5 at xhigh effort for architecture, complex debugging, and security (costRatio is an estimated token-spend multiplier, not a price difference)",
+        "steps": 120,
         "whenToUse": [
           "Architecture decisions",
           "Complex debugging (after 2+ failures)",
@@ -70,53 +416,67 @@
     },
     "zai-turbo": {
       "fast": {
-        "model": "GLM-5-Turbo",
+        "model": "zai/GLM-5-Turbo",
         "costRatio": 1,
-        "color": "green",
         "description": "GLM-5-Turbo for read-only exploration, search, and simple lookups",
-        "maxTurns": 30,
-        "tools": ["Read", "Grep", "Glob", "Bash"],
         "whenToUse": [
           "Codebase exploration and search",
           "Simple file reads and listing",
           "Grep/glob operations"
-        ]
+        ],
+        "maxTurns": 30,
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash"
+        ],
+        "color": "green"
       },
       "medium": {
-        "model": "GLM-5.2",
+        "model": "zai/GLM-5.2",
         "costRatio": 5,
-        "color": "yellow",
         "description": "GLM-5.2 for implementation, refactoring, and tests",
-        "maxTurns": 50,
-        "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write"],
         "whenToUse": [
           "Feature implementation",
           "Refactoring",
           "Writing tests",
           "Bug fixes"
-        ]
+        ],
+        "maxTurns": 50,
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash",
+          "Edit",
+          "Write"
+        ],
+        "color": "yellow"
       },
       "heavy": {
-        "model": "GLM-5.3",
-        "thoughtLevel": "max",
+        "model": "zai/GLM-5.3",
         "costRatio": 20,
-        "color": "red",
         "description": "GLM-5.3 (max reasoning) for architecture, complex debugging, and security",
-        "maxTurns": 120,
-        "tools": ["Read", "Grep", "Glob", "Bash", "Edit", "Write"],
         "whenToUse": [
           "Architecture decisions",
           "Complex debugging (after 2+ failures)",
           "Security review",
           "Performance optimization"
-        ]
+        ],
+        "maxTurns": 120,
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash",
+          "Edit",
+          "Write"
+        ],
+        "color": "red",
+        "thoughtLevel": "max"
       }
     }
-  },
-  "tierPrompts": {
-    "fast": "STOP CONDITIONS — read these FIRST, they govern EVERY tool call:\n\n1. CAP: ≤8 read-only tool calls (grep/read/glob/ls) per dispatch. If the dispatch prompt contains `CAP:N`, N is your cap; `CAP:none` removes the numeric cap. The router runtime tracks your count and injects `[cap: N/MAX]` into every read-only tool result — that's your LIVE COUNTER. When N=MAX, your next action MUST be a return, not another read.\n\n2. REDUNDANCY: before every new read/grep/glob, ask yourself: \"Am I re-reading the same file or re-running a similar search I already ran?\" The runtime ALSO detects this and injects `[⚠ REDUNDANT]` when you repeat a call. When you see that marker, STOP IMMEDIATELY — do not attempt another read.\n\n3. RETURN PROTOCOL: on stop (cap reached, redundancy detected, or scope satisfied), return with EXACTLY ONE of these prefixes as the FIRST line of your response:\n   - `DONE: [one-line summary]` — the dispatch request is fully satisfied with what you have.\n   - `NEED MORE: [specific ask]` — you need the orchestrator to dispatch another targeted round.\n   - `ESCALATE: [reason]` — hand back for orchestrator to re-dispatch or decide.\n\n4. EXCEEDING CAP: only if the task is irreversibly incomplete AND returning with NEED MORE is worse than one more read. Prepend `reason: <1-line>` above your return. This should be rare.\n\n---\n\nROLE: You are @fast — a read-only exploration specialist. Scope: search, grep, read, ls, lookup, doc-lookup, type-check, count, exists-check, git-info. NEVER write, edit, or modify files (Bash is for read-only inspection commands like git log, ls, wc). If the task includes edits, STOP and report back that the orchestrator must dispatch @medium instead. Return findings concisely: file:line paths, quoted snippets, and a one-line summary.\n\nPrefer a single focused pass; stop as soon as you have enough to answer the exact question asked. Do not explore beyond the asked scope. NO SUB-DELEGATION: you have no Agent tool — work within your scope and return findings.",
-    "medium": "STOP CONDITIONS — read these FIRST, they govern EVERY read-only tool call BEFORE you begin editing:\n\n1. CAP: ≤5 read-only tool calls (grep/read/glob/ls) before you start editing. `CAP:N` in the dispatch overrides; `CAP:none` disables. The router runtime tracks your reads and injects `[cap: N/MAX]` into every read-only tool result — that's your LIVE COUNTER. When N=MAX, start editing or return; do not make another read-only call.\n\n2. REDUNDANCY: before every new grep/read, ask: \"Did I already read this file or run a similar search?\" The runtime injects `[⚠ REDUNDANT]` when you repeat a call. When you see that marker, STOP reading and either start editing with what you have, or return NEED CONTEXT.\n\n3. RETURN PROTOCOL (when stopping before/instead of full implementation): first line of your response must be EXACTLY ONE of:\n   - `DONE: [summary of edits + verification]` — implementation complete.\n   - `NEED CONTEXT: [specific ask]` — requires orchestrator to dispatch @fast and re-invoke.\n   - `ESCALATE: [reason]` — scope grew beyond implementation (e.g. architectural decision needed).\n\n4. EXCEEDING CAP: only when the implementation genuinely requires more context. Prepend `reason: <1-line>` above your summary.\n\n---\n\nROLE: You are @medium — an implementation specialist. Scope: write/edit code, refactor, write tests, fix bugs, apply build-fixes, create files, config changes, API endpoints. Match existing project patterns exactly. Never suppress type errors (no `as any`, `@ts-ignore`, `@ts-expect-error`). Run targeted tests/linters for the changed area only — never the full suite unless asked. If you hit 2+ consecutive failures on the same issue, STOP and report back to the orchestrator with what you tried; do not self-escalate to @heavy. Return a concise summary: files changed, key decisions, tests added, verification run.\n\nNO SUB-DELEGATION: you have no Agent tool — you cannot spawn @fast or @heavy. Avoid grep/read-exhaustive sweeps.",
-    "heavy": "STOP CONDITIONS — read these FIRST, they govern EVERY tool call:\n\n1. CAP: ≤3 reads/greps per dispatch. `CAP:N` in the dispatch overrides; `CAP:none` disables (used in `deep` mode). The router runtime tracks your count and injects `[cap: N/MAX]` into every read-only tool result — that's your LIVE COUNTER. You are an analysis specialist, not a reconnaissance specialist: at N=MAX, return your analysis based on what you have, or return `SCOPE GROWTH` asking for @fast pre-exploration.\n\n2. REDUNDANCY: before every new tool call, ask: \"Is this re-reading ground I've already covered or information already in my context?\" The runtime injects `[⚠ REDUNDANT]` when you repeat a call. When you see that marker, STOP IMMEDIATELY — repeated reads do not add analysis value.\n\n3. RETURN PROTOCOL: first line of your response must be EXACTLY ONE of:\n   - `DONE: [structured analysis]` — request fully satisfied.\n   - `SCOPE GROWTH: prefer @fast pre-exploration of [specific files/patterns/areas] before I continue.` — orchestrator dispatches @fast and re-invokes you.\n   - `ESCALATE: [reason]` — hand back for orchestrator decision.\n\n4. EXCEEDING CAP: only when the analysis genuinely cannot be completed without one more read AND `SCOPE GROWTH` would be worse. Prepend `reason: <1-line>`.\n\n---\n\nROLE: You are @heavy — a senior architecture and debugging consultant. Scope: architecture decisions, security review, perf optimization, complex debugging (invoked after ≥2 prior failures), multi-system tradeoffs, migration strategy, root-cause analysis. Analyze exhaustively WITHIN the context you were given. Provide reasoning, tradeoffs, and concrete recommendations. Default to analysis + recommendations; write code only when the orchestrator explicitly asked for implementation. Return structured output: problem framing → options considered → tradeoffs → recommendation → implementation notes (if applicable).\n\nNO SUB-DELEGATION: you have no Agent tool. Your job is analysis, not reconnaissance. 40 minutes of file reads is not analysis — it's reconnaissance. Stop early, analyze what you have, return SCOPE GROWTH if genuinely needed."
   },
   "taskPatterns": {
     "fast": [
@@ -127,10 +487,10 @@
       "ls",
       "lookup-docs/types",
       "count",
-      "exists-check",
-      "rename"
+      "exists-check"
     ],
     "medium": [
+      "rename",
       "impl-feature",
       "refactor",
       "write-tests",
@@ -166,11 +526,11 @@
         "default→@fast unless edits/complex-reasoning needed",
         "@medium ONLY: multi-file-edit/refactor/test-suite/build-fix",
         "@heavy ONLY: user-requested OR ≥2 @medium failures",
-        "trivial(grep/read/glob)→direct,no-delegate",
+        "trivial(grep/read/glob)→direct,spends orchestrator read-only allowance",
         "batch related searches→single @fast",
         "uncertain @fast vs @medium→@fast,escalate on fail",
         "dispatch caps (tighter): always include CAP:5 when dispatching @fast, CAP:2 for @medium, CAP:2 for @heavy",
-        "orchestrator self-cap: ≤1 direct read-only call per turn; 2nd need → dispatch @fast"
+        "orchestrator read-only allowance: dispatch is default; ≤1 direct read-only call per turn; 2nd need → dispatch @fast"
       ]
     },
     "quality": {
@@ -181,7 +541,7 @@
         "@heavy: arch/debug/security/multi-file-coord",
         "@fast ONLY: trivial single-tool ops (1 grep/1 read)",
         "prefer thoroughness over speed",
-        "dispatch caps: always include CAP:none in dispatch prompts — subagents may explore as needed for deep context",
+        "dispatch caps: always include CAP:none with a `reason:` line in dispatch prompts — subagents may explore as needed for deep context",
         "subagents still run redundancy check; CAP:none only lifts the numeric cap, not the stop-on-redundancy rule"
       ]
     },
@@ -192,10 +552,39 @@
         "default→@medium for implementation and multi-file changes",
         "@heavy for architecture/debug/security/tradeoff-analysis by default",
         "allow long heavy runs before fallback; avoid premature downshift",
-        "trivial(grep/read/glob)→direct,no-delegate",
+        "trivial one-off lookup(grep/read/glob) that settles the question→direct; further reads→@fast",
         "if task is composite: explore@fast then execute@heavy",
-        "dispatch caps: CAP:none for @heavy only; @fast=CAP:8 and @medium=CAP:5 baselines apply",
+        "dispatch caps: CAP:none (with a `reason:` line) for @heavy only; @fast=CAP:8 and @medium=CAP:5 baselines apply",
         "subagents still run redundancy check; CAP:none only lifts the numeric cap"
+      ]
+    }
+  },
+  "fallback": {
+    "global": {
+      "anthropic": [
+        "openai",
+        "google",
+        "github-copilot"
+      ],
+      "openai": [
+        "anthropic",
+        "google",
+        "github-copilot"
+      ],
+      "github-copilot": [
+        "anthropic",
+        "openai",
+        "google"
+      ],
+      "google": [
+        "openai",
+        "anthropic",
+        "github-copilot"
+      ],
+      "zai-coding-plan": [
+        "anthropic",
+        "openai",
+        "google"
       ]
     }
   },
@@ -204,12 +593,17 @@
     "plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy",
     "default preference: read-only work → @fast; implementation → @medium",
     "orchestrate=self, execute=subagent (info-gathering IS execution, not orchestration)",
-    "trivial (≤1 tool call, no expected follow-up) → direct, skip-delegate",
-    "orchestrator self-cap (TARGET): ≤2 direct read-only calls per turn; 3rd need → dispatch @fast (exceed only with 1-line reason)",
-    "dispatch caps baseline: @fast=CAP:8, @medium=CAP:5, @heavy=CAP:3 (omit directive = baseline; include CAP:N to override; CAP:none disables)",
+    "trivial (≤1 tool call, no expected follow-up) → direct, spent from the orchestrator read-only allowance",
+    "orchestrator read-only allowance (TARGET): dispatch is default; ≤2 direct read-only calls per turn; 3rd need → dispatch @fast (exceed only with 1-line reason)",
+    "dispatch caps baseline: @fast=CAP:8, @medium=CAP:5, @heavy=CAP:3 (omit directive = baseline; include CAP:N to override; CAP:none disables the cap only when the dispatch also carries a `reason:` line)",
     "before dispatching @heavy: gather context first (usually via @fast); if context is already sufficient, dispatch directly",
-    "if your model equals @heavy's model: handle heavy work locally (no self-delegation); still route broader read-only exploration to @fast",
+    "if self is opus: skip-@heavy (do locally); still prefer routing broader read-only exploration to @fast",
     "min(cost, adequate-tier)"
   ],
-  "defaultTier": "medium"
+  "defaultTier": "medium",
+  "verifyDefaults": {
+    "testCommand": "npm test",
+    "buildCommand": "npm run build",
+    "lintCommand": "npm run lint"
+  }
 }

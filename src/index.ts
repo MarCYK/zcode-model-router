@@ -1,0 +1,3241 @@
+import type { Plugin } from "@opencode-ai/plugin";
+import type { RouterPluginInput } from "./compat/child-session";
+import { DEPTH_BANNER, ResumeRejectedError, TASK_VERIFICATION } from "./compat/child-session";
+
+// Imports for internal use within this module
+import {
+  loadConfig,
+  resolvePresetName,
+  writeState,
+  invalidateConfigCache,
+  getConfigReloadError,
+  overridePath,
+  localOverridePath,
+  findProjectOverride,
+  resolveVerifyBudget,
+  resolveDepthLimit,
+  resolveRouting,
+  resolveRolesRouting,
+  resolveVariantSteps,
+  routerStatusLines,
+  warnConfigIssues,
+  resolveActiveTiers,
+} from "./router/config";
+import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
+import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
+import { gitTools } from "./router/git-tools";
+import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
+import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
+import { filterSensitiveGrep } from "./router/sensitive-paths";
+import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
+import { stripDelegateInstructions } from "./router/instructions";
+import { buildDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, routeLineRoot } from "./router/dispatch-header";
+import { detectFalseRefusal, parseTaskResult as parseRefusalTaskResult } from "./router/false-refusal";
+import {
+  buildTiersOutput,
+  buildPresetList,
+  buildPresetSwitched,
+  buildUnknownPreset,
+  buildNoModes,
+  buildBudgetList,
+  buildBudgetSwitched,
+  buildUnknownMode,
+  buildBypassMessage,
+  buildEnforceSet,
+  buildEnforceStatus,
+  buildOverridesOutput,
+  buildRouterHelp,
+  buildModelsOutput,
+  formatModelIssues,
+} from "./commands/output";
+import {
+  resolveSubagentOverrides,
+  DEFER_MISSING_SUBAGENT_NOTICE,
+  HOST_SEED_AGENTS,
+  mergeSubagentOverride,
+} from "./router/subagents";
+import { fingerprintToolCall } from "./guard/fingerprint";
+import { detectNarration } from "./guard/narration";
+import {
+  getActiveTiers,
+  buildDelegationProtocol,
+  isClaudeModel,
+  CLAUDE_TIER_PREFIX,
+  CLAUDE_ORCHESTRATOR_PREFIX,
+  CLAUDE_ANTI_NARRATION,
+  assembleSystemPrompt,
+  assembleRolesSystemPrompt,
+  DELEGATE_TOOL_DESCRIPTION,
+} from "./router/protocol";
+import { resolveRoles, type RoleSpec } from "./router/roles";
+import { routerRunTool, type RunRecord } from "./router/run-tools";
+import type { WorkRootAnswer } from "./router/git-tools";
+import { GUARD_CUMULATIVE_MULTIPLIER, roleGuardProfile, type GuardProfile } from "./router/guard-profile";
+import { currentBinding } from "./routing/roles/binding";
+import { authorityTool, requestedAuthority } from "./routing/roles/authority";
+import {
+  CARRIED_NO_PROCESS_REASON, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot,
+} from "./routing/wire/dispatch";
+import { roleTierOrder } from "./routing/engine/ladders";
+import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
+import type { IngestSettings } from "./routing/outcomes/ingest";
+import { captureBudget } from "./guard/enforce";
+import { budgetClaimObserved, isIncompleteVerdict } from "./verify/checker";
+import { lookupDispatch } from "./router/sessions";
+import { resolveEnforcementMode } from "./router/enforcement";
+import { createPluginLogger } from "./router/logger";
+import { createCatalogPricing, createIngest, ingestSettings } from "./routing/outcomes/ingest";
+import type { Ingest } from "./routing/outcomes/ingest";
+import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./routing/outcomes/types";
+import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
+import { roleAgentSteps } from "./router/role-agents";
+import type { HostBudgetObservation } from "./compat/v2-hooks";
+import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
+import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
+import type { HostAgentInfo } from "./routing/engine/types";
+import { createEngineRuntime } from "./routing/wire/runtime";
+import type { EngineRuntime } from "./routing/wire/runtime";
+import {
+  advisorSettings,
+  catalogFromProviders,
+  createAdvisorNotifier,
+  formatFindings,
+  hostConfigFromAgents,
+  runAdvisor,
+} from "./routing/advisor";
+import type { AdvisorCatalogModel, AdvisorExtras, HostConfigView } from "./routing/advisor";
+import {
+  findOrphanedStrongPatterns,
+  normalizeCatalog,
+  validateModels,
+} from "./router/catalog";
+import type { Catalog } from "./router/catalog";
+import {
+  createSessionStore,
+  parseCapDirective,
+  buildCapBanner,
+  DEFAULT_TIER_CAPS,
+  READ_ONLY_TOOLS,
+  awaitExecutionEnd,
+  lastStepContext,
+} from "./router/sessions";
+import type { Cap, SubagentState } from "./router/sessions";
+import { createTrajectoryStore } from "./telemetry/trajectory";
+import { createGuardStore } from "./guard/store";
+import { createIdleTtlSweeper } from "./router/idle-sweep";
+import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, isAbsolute } from "node:path";
+import { access, readFile as fsReadFile } from "node:fs/promises";
+import { tool } from "@opencode-ai/plugin";
+import { scrubText } from "./guard/scrub";
+import { accept, unverifiableGateResult } from "./verify/gate";
+import { applyDispatchCaveats, createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
+import { appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock } from "./verify/pending";
+import { createDeadline } from "./verify/deterministic";
+import {
+  DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
+  RouterTimeoutError,
+  timeoutMs,
+  withTimeout,
+} from "./verify/timeout";
+import {
+  createChangedFileStore,
+  parseTaskResult,
+  buildDelegationDoD,
+  tierModel,
+  shouldVerifyTask,
+  buildForcingNote,
+  buildAcceptedSuffix,
+} from "./verify/dispatch";
+import { requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
+import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
+import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
+import { classifyDelegation, createAttemptRecorder } from "./escalate/attempt-recorder";
+import type { AttemptRecorder, DelegationFacts } from "./escalate/attempt-recorder";
+import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
+import { createDepthGuard } from "./router/depth-guard";
+import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
+
+// ---------------------------------------------------------------------------
+// Re-exports — type-only re-exports for IDE/test consumers.
+// NOTE: value re-exports are intentionally absent. opencode's plugin loader
+// calls every function export as a factory (Ck iterates Object.values(mod));
+// adding named function exports would cause spurious factory calls.
+// Tests import from their specific source files instead of this entry point.
+// ---------------------------------------------------------------------------
+
+export type { RouterConfig, TierConfig, Preset, ModeConfig, FallbackConfig, EnforcementConfig } from "./router/config";
+export type { Cap, SubagentState };
+export type { TrajectoryState, TrajectoryToolEvent } from "./telemetry/trajectory";
+export type { EnforcementMode } from "./router/enforcement";
+export type { GuardPolicy, GuardState, GuardCall, GuardDecision } from "./guard/guards";
+
+/** Diagnostics must also tolerate thrown values without primitive conversion. */
+function describeError(error: unknown): string {
+  try {
+    return scrubText(String(error));
+  } catch {
+    return "unprintable error";
+  }
+}
+
+/**
+ * #84 P2.2 (advisor `tierDispatches`): dispatch rows WITHOUT a role at or after `since` — non-annotation `dispatch` decision rows,
+ * the first row per decision id (as `summarizeRoles` keeps them), whose row names no role and whose chosen key is not a role's.
+ */
+function tierDispatchCount(rows: readonly LogRow[], since: number): number {
+  const seen = new Set<string>();
+  let count = 0;
+  for (const row of rows) {
+    if (row.kind !== "decision" || isAnnotationRow(row) || row.step !== "dispatch" || seen.has(row.decisionID)) continue;
+    seen.add(row.decisionID);
+    const t = Date.parse(row.ts);
+    if (!Number.isFinite(t) || t < since) continue;
+    if (typeof row.role === "string" || row.chosen?.origin === "role") continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * #84 P2.1 (handoffs 22, 23): one budget observation from the guard's and the host's. A stop seen by either is a stop; without a
+ * host observer (v1, or a host that does not hand one) the guard's alone; otherwise anything unobserved leaves it unobserved.
+ */
+function foldBudgetObservation(guard: HostBudgetObservation, host: HostBudgetObservation | undefined): HostBudgetObservation {
+  if (guard === true || host === true) return true;
+  if (host === undefined) return guard;
+  return guard === "unobserved" || host === "unobserved" ? "unobserved" : false;
+}
+
+function saveActivePreset(presetName: string, projectDir?: string): void {
+  const cfg = loadConfig(projectDir);
+  const resolved = resolvePresetName(cfg, presetName);
+  if (!resolved) {
+    return;
+  }
+
+  cfg.activePreset = resolved;
+
+  // Persist user-selected preset to state file only — never mutate tiers.json
+  writeState({ activePreset: resolved });
+
+  // Invalidate cache so next read picks up the new active preset
+  invalidateConfigCache();
+}
+
+function saveActiveMode(modeName: string, projectDir?: string): void {
+  const cfg = loadConfig(projectDir);
+  if (!cfg.modes?.[modeName]) {
+    return;
+  }
+
+  cfg.activeMode = modeName;
+  writeState({ activeMode: modeName });
+  invalidateConfigCache();
+}
+
+function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
+  writeState({ enforcementMode: mode });
+  invalidateConfigCache();
+}
+
+/**
+ * `/router` dispatch. Decides and persists here; rendering lives in
+ * src/commands/output.ts.
+ */
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>): string {
+  const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  const sub = (tokens[0] ?? "").toLowerCase();
+
+  if (sub === "enforce") {
+    const mode = (tokens[1] ?? "").toLowerCase();
+    if (mode === "off" || mode === "advisory" || mode === "enforced") {
+      saveEnforcementMode(mode);
+      return buildEnforceSet(mode);
+    }
+    return buildEnforceStatus(
+      resolveEnforcementMode({ config: cfg, env: process.env }).mode,
+    );
+  }
+
+  if (sub === "overrides") {
+    const globalPath = overridePath();
+    const foundLocal = findProjectOverride(projectDir);
+    const localPath = foundLocal ?? localOverridePath(projectDir);
+    return buildOverridesOutput({
+      globalPath,
+      globalPresent: existsSync(globalPath),
+      localPath,
+      localPresent: existsSync(localPath),
+      localFound: foundLocal !== undefined,
+      activePreset: cfg.activePreset,
+    });
+  }
+
+  return buildRouterHelp(
+    resolveEnforcementMode({ config: cfg, env: process.env }).mode,
+    // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
+    // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }) },
+  );
+}
+
+/** `/budget` dispatch. Persists the switch, then renders. */
+function buildBudgetOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
+  const modes = cfg.modes;
+  if (!modes || Object.keys(modes).length === 0) return buildNoModes();
+
+  const requested = args.trim().toLowerCase();
+  if (!requested) return buildBudgetList(cfg);
+
+  const mode = modes[requested];
+  if (mode) {
+    saveActiveMode(requested, projectDir);
+    return buildBudgetSwitched(mode, requested);
+  }
+
+  return buildUnknownMode(modes, requested);
+}
+
+/** `/preset` dispatch. Persists the switch, then renders. */
+function buildPresetOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
+  const requestedPreset = args.trim();
+  if (!requestedPreset) return buildPresetList(cfg);
+
+  const resolvedPreset = resolvePresetName(cfg, requestedPreset);
+  if (resolvedPreset) {
+    saveActivePreset(resolvedPreset, projectDir);
+    cfg.activePreset = resolvedPreset;
+    return buildPresetSwitched(cfg, resolvedPreset);
+  }
+
+  return buildUnknownPreset(cfg, requestedPreset);
+}
+
+// Fail-closed skips in system.transform are silent by design, but a transform
+// that never carries a sessionID would silently disable routing for the whole
+// session. Surface it once rather than never.
+let warnedMissingTransformSession = false;
+function warnMissingTransformSessionOnce(): void {
+  if (warnedMissingTransformSession) return;
+  warnedMissingTransformSession = true;
+  console.warn(
+    "[model-router] chat.system.transform received no sessionID; skipping delegation-protocol injection (fail-closed)",
+  );
+}
+
+let warnedSessionLookupFailed = false;
+function warnSessionLookupFailedOnce(): void {
+  if (warnedSessionLookupFailed) return;
+  warnedSessionLookupFailed = true;
+  console.warn(
+    "[model-router] session lookup failed while classifying a chat.system.transform session; assuming top-level orchestrator",
+  );
+}
+
+/**
+ * Agents the v1 host defines itself (opencode v1.18.34 agent.ts). They are absent from the `opencodeConfig.agent`
+ * record the config hook receives, so `subagentTiers` needs them listed to avoid a false `missing` skip (QA-81-4).
+ */
+const V1_HOST_BUILTIN_AGENTS: Record<string, { mode: string }> = {
+  general: { mode: "subagent" },
+  explore: { mode: "subagent" },
+  build: { mode: "primary" },
+  plan: { mode: "primary" },
+  title: { mode: "primary" },
+  summary: { mode: "primary" },
+  compaction: { mode: "primary" },
+};
+
+const SESSION_ROOT_MEMO_MAX = 500;
+const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
+
+const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
+  // Project directory this plugin instance serves. Hosts that run several
+  // projects in one process (OpenCode v2) may also move process.cwd() away from
+  // it, so config/override lookup must use this and never the working directory.
+  const projectDir: string | undefined = ctx.directory || ctx.worktree || undefined;
+  let cfg = loadConfig(projectDir);
+  let activeTiers = getActiveTiers(cfg);
+
+  // Per-plugin-instance session store: owns subagentSessionIDs and subagentCapState.
+  const sessionStore = createSessionStore();
+  /** v1 sessionID -> plugin agent name, from chat.message (tool.execute.after has no `agent` on v1). */
+  const pluginAgentSessions = new Map<string, string>();
+  /** Records a plugin-agent session, bounded like the session-root memo (oldest entry evicted first). */
+  const rememberPluginAgentSession = (sessionID: string, agent: string): void => {
+    pluginAgentSessions.delete(sessionID);
+    pluginAgentSessions.set(sessionID, agent);
+    while (pluginAgentSessions.size > SESSION_ROOT_MEMO_MAX) {
+      const oldest = pluginAgentSessions.keys().next().value;
+      if (oldest === undefined) break;
+      pluginAgentSessions.delete(oldest);
+    }
+  };
+  /** Plugin agents the v1 config hook built on its previous run -> the host entry it merged (QA-81-8). */
+  let builtPluginAgents = new Map<string, Record<string, unknown> | undefined>();
+  let systemDebugLogged = false;
+  let dispatchDebugLogged = false;
+
+  // Authoritative orchestrator-vs-child classification memo, keyed by sessionID.
+  // true  = proven top-level (no parentID) -> inject the delegation protocol
+  // false = proven child -> never inject
+  // absent = not yet resolved
+  //
+  // Exists because session.created is an EVENT: nothing guarantees the plugin
+  // has processed it before the child's first system.transform runs. Tier-named
+  // agents are also marked synchronously from chat.message, but `general`,
+  // `explore`, markdown-defined agents and everything mapped through
+  // `subagentTiers` (which can never be tier-named by construction) have no
+  // synchronous path at all. One session.get per session closes that race
+  // without depending on event ordering.
+  const sessionRootMemo = new Map<string, boolean>();
+  /** Recent lookup failures throttle retries without permanently memoising root. */
+  const sessionLookupFailedAt = new Map<string, number>();
+
+  /**
+   * Resolve whether a session is the top-level orchestrator, authoritatively.
+   *
+   * Returns true only when the backend confirms the session has no parentID.
+   * Returns false when it confirms a parentID (and marks the session as a child
+   * so the synchronous path catches it next time).
+   *
+   * On lookup failure it returns true — deliberately NOT fail-closed. A transient
+   * backend error must not silently strip the orchestrator of its routing rules
+   * for the rest of the session; the event path and the chat.message path both
+   * still cover the common cases, so the exposure is a rare, transient re-run of
+   * the old behaviour rather than a permanent loss of function.
+   */
+  const resolveIsRootSession = async (sessionID: string): Promise<boolean> =>
+    (await lookupRootSession(sessionID)) ?? true;
+
+  /**
+   * The lookup behind resolveIsRootSession: true (no parentID), false (a parentID), or undefined
+   * when it is not known (the lookup failed, or failed recently and is throttled). QA-2.4-2 treats
+   * undefined as NOT root (isProvenRootCaller), where the protocol injection treats it as root.
+   */
+  const lookupRootSession = async (sessionID: string): Promise<boolean | undefined> => {
+    const memo = sessionRootMemo.get(sessionID);
+    if (memo !== undefined) {
+      if (!memo) sessionStore.markChildSession(sessionID);
+      else depthTracker.recordRoot(sessionID);
+      return memo;
+    }
+    const failedAt = sessionLookupFailedAt.get(sessionID);
+    if (failedAt !== undefined && Date.now() - failedAt < SESSION_LOOKUP_RETRY_MS) {
+      return undefined;
+    }
+    try {
+      const res = await ctx.client.session.get({ path: { id: sessionID } });
+      if (!res || (res as { error?: unknown }).error || !res.data) {
+        throw new Error("session.get returned no session data");
+      }
+      sessionLookupFailedAt.delete(sessionID);
+      const parentID = res?.data?.parentID;
+      const isRoot = !(typeof parentID === "string" && parentID !== "");
+      sessionRootMemo.set(sessionID, isRoot);
+      while (sessionRootMemo.size > SESSION_ROOT_MEMO_MAX) {
+        const oldest = sessionRootMemo.keys().next().value;
+        if (oldest === undefined) break;
+        sessionRootMemo.delete(oldest);
+      }
+      if (!isRoot) sessionStore.markChildSession(sessionID);
+      if (isRoot) depthTracker.recordRoot(sessionID);
+      else depthTracker.recordCreated(sessionID, parentID as string);
+      return isRoot;
+    } catch {
+      sessionLookupFailedAt.set(sessionID, Date.now());
+      while (sessionLookupFailedAt.size > SESSION_ROOT_MEMO_MAX) {
+        const oldest = sessionLookupFailedAt.keys().next().value;
+        if (oldest === undefined) break;
+        sessionLookupFailedAt.delete(oldest);
+      }
+      warnSessionLookupFailedOnce();
+      return undefined;
+    }
+  };
+
+  // Per-plugin-instance trajectory store (Phase 0.3 scaffolding — RECORD-ONLY).
+  // Observes subagent tool activity to build a per-session scorecard. It emits
+  // NOTHING into any model-visible output; the only externally observable effect
+  // is an opt-in debug dump gated behind MODEL_ROUTER_TRAJECTORY_DEBUG=1.
+  const trajectoryStore = createTrajectoryStore();
+
+  // Per-plugin-instance guard state (Layer 1 hard-block). Only engaged for
+  // subagent sessions when enforcement mode is advisory/enforced; in "off"
+  // mode no guard state is ever created, so behaviour stays byte-identical.
+  const guardStore = createGuardStore();
+
+  const changedFileStore = createChangedFileStore();
+
+  // Idle-TTL maintenance for the four per-instance stores. No timer is
+  // scheduled: the sweeper is invoked opportunistically from chat.message and
+  // self-throttles, so a long-lived plugin instance cannot accumulate state for
+  // sessions that went away without a teardown hook.
+  const sweepIdleStores = createIdleTtlSweeper([
+    () => sessionStore.sweep(),
+    () => guardStore.sweep(),
+    () => trajectoryStore.sweep(),
+    () => changedFileStore.sweep(),
+    () => depthTracker.sweep(),
+    // 2.2.3: the S5 batch coordinator's defensive eviction (batch.ts B11). Declared below; the
+    // sweeper only runs from chat.message, long after this factory has returned.
+    () => { sweepVerification(); },
+    // 2.4.2b: TTL eviction and reaping of the pending registry (pending.ts R7; no timer of its own).
+    () => { pending.sweep(); },
+    // 2.1.2: expired dispatch registrations and idle open outcome attempts (v2 only; `ingest` is declared below).
+    () => { ingest?.sweep(); },
+    // 2.3: release the ladder-attempt recorder's outcomes bundle once the engine is static again.
+    () => { attemptRecorder?.sweep(); },
+  ]);
+
+  // Layer-2's impure corner: exec, fs, and the opencode client, built once and
+  // read back through getConfig so a reloaded cfg (from /preset, /budget or
+  // /router enforce) applies to graded work too.
+  // Passive warnings go to opencode's log rather than stderr: console output
+  // from a plugin paints over the TUI. Falls back to console when the server
+  // has no /log endpoint. See src/router/logger.ts.
+  const logger = createPluginLogger(ctx.client);
+  const routerWarn = { warn: (message: string) => logger.warn(message) };
+
+  // -------------------------------------------------------------------------
+  // #84 P2.1 (T2.1.3): the role runtime of roles mode on OpenCode v2. `rolesNow()` is empty on v1 and in tiers mode, so
+  // every role branch below is skipped there and both stay byte-identical (§2.7, I1, I8).
+  // -------------------------------------------------------------------------
+  const isV2Host = ctx.routerHost === "v2";
+  /**
+   * QA-P21-1-8 (plan R8): the role runtime exists only when the plugin STARTED in roles mode — its role tools are registered at
+   * start and its role agents only then (the v2 adapter logs "restart OpenCode" when the config switches to roles at runtime).
+   */
+  const startedInRoles = isV2Host && cfg.routing?.delegation === "roles";
+  /** QA-P21-2-4: the v2 adapter's "this role agent is registered" check (absent on v1 and before the adapter is set up). */
+  const roleLiveOf = (ctx as RouterPluginInput & { routerRoleLive?: (agent: string) => boolean | undefined }).routerRoleLive;
+  const NO_ROLES: ReadonlyMap<string, RoleSpec> = new Map();
+  const roleTables = new WeakMap<RouterConfig, ReadonlyMap<string, RoleSpec>>();
+  /** The role agents of the current config, cached per config object (hot reload builds a new one). */
+  const rolesNow = (): ReadonlyMap<string, RoleSpec> => {
+    if (!startedInRoles) return NO_ROLES;
+    const current = cfg;
+    let roles = roleTables.get(current);
+    if (roles === undefined) {
+      try {
+        roles = resolveRoles(current, "v2");
+      } catch (error) {
+        roles = NO_ROLES;
+        logger.warn("[router] roles: the role table could not be resolved; no role runtime for this config", { error: describeError(error) });
+      }
+      roleTables.set(current, roles);
+    }
+    // QA-P21-2-4: a role whose agent registration failed is not live (the v2 adapter's check; undefined = not known yet).
+    const live = roleLiveOf === undefined ? [...roles] : [...roles].filter(([name]) => roleLiveOf(name) !== false);
+    return live.length === roles.size ? roles : new Map(live);
+  };
+  const roleSpecOf = (agent: unknown): RoleSpec | undefined => (typeof agent === "string" ? rolesNow().get(agent) : undefined);
+  /** `maxOf` of every `currentBinding` call (handoff 33). */
+  const roleMaxOf = (agent: string) => roleMaxActions(rolesNow().get(agent));
+  /** Role child sessions → their role agent: from the tool hooks' calling agent and `session.created` (bounded, oldest out). */
+  const roleSessions = new Map<string, string>();
+  const ROLE_STATE_MAX = 1000;
+  const rememberRoleSession = (sessionID: unknown, agent: unknown): boolean => {
+    if (typeof sessionID !== "string" || sessionID === "" || typeof agent !== "string" || roleSpecOf(agent) === undefined) return false;
+    roleSessions.delete(sessionID);
+    roleSessions.set(sessionID, agent);
+    while (roleSessions.size > ROLE_STATE_MAX) roleSessions.delete(roleSessions.keys().next().value!);
+    return true;
+  };
+  /** The role of a session: what its tool hooks named, else what the dispatch registry recorded for it. */
+  const roleOfSession = (sessionID: unknown): RoleSpec | undefined => typeof sessionID !== "string" || sessionID === ""
+    ? undefined : roleSpecOf(roleSessions.get(sessionID) ?? lookupDispatch(sessionID)?.agent);
+  /**
+   * Handoff 11 (P-10, P-18): the ONE work-root resolver of `router_run` and `router_git_*`, from the child's binding (bound by the
+   * adapter's `execute.before` before any tool of the child runs). Not a role session → `{ role: false }` (git keeps today's
+   * directory; `router_run` refuses); a role session without a binding or a work root → `{ role: true, root: null }` (I9).
+   */
+  const resolveWorkRoot = (sessionID: string): WorkRootAnswer => {
+    if (roleOfSession(sessionID) === undefined) return { role: false };
+    return { role: true, root: currentBinding(sessionID, { maxOf: roleMaxOf })?.grant.workRoot ?? null };
+  };
+  /**
+   * #84 P2.3 (P-12, S11, I3): no `evaluate` fires for a plugin tool, so each tool's own resolver also refuses a role session whose
+   * dispatch grant lacks the tool's action (`router_run`: exec; `router_git_*`: local): the answer is then "no bound work root"
+   * and the tool refuses (I9). The context hook's catalog filter is the primary control; this one holds when a call gets through.
+   */
+  const resolveWorkRootFor = (action: "router_run" | "router_git") => (sessionID: string): WorkRootAnswer => {
+    const answer = resolveWorkRoot(sessionID);
+    if (!answer.role) return answer;
+    const grant = currentBinding(sessionID, { maxOf: roleMaxOf })?.grant;
+    return grant !== undefined && grant.actions.has(action) ? answer : { role: true, root: null };
+  };
+  /** What a routed role dispatch decided for its child's guard (QA-G-A3-3): the dispatched tier and the route line's `budget=`. */
+  interface RoutedGuardInput { readonly agent: string; readonly tier: string; readonly routeBudget: number | null }
+  /**
+   * QA-G-B-5 / QA-G-A3-3: each routed role dispatch this instance noted, by the parent's call — when it was dispatched (the
+   * attempt's start, for the `run` signal) and its routed guard input. Bounded, oldest out.
+   */
+  const roleAttempts = new Map<string, RoutedGuardInput & { readonly at: number }>();
+  /** QA-G-A3-3: the routed guard input of each role child — its latest routed dispatch or resume (a resume replaces it). */
+  const roleChildGuards = new Map<string, RoutedGuardInput>();
+  /** QA-G-A3-2-2: the largest round budget each role child's guard profile had (its cumulative limit follows it). */
+  const roleBudgetPeaks = new Map<string, number>();
+  const setBounded = <T>(map: Map<string, T>, key: string, value: T): void => {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > ROLE_STATE_MAX) map.delete(map.keys().next().value!);
+  };
+  /**
+   * QA-G-A3-3: the routed guard input of a role child. A resume set it in `noteRoleDispatch`; a fresh child takes its dispatch's
+   * once it is bound EXACTLY (its binding names the parent's call). Undefined when no routed decision is known for it.
+   */
+  const routedGuardOf = (sessionID: string): RoutedGuardInput | undefined => {
+    const known = roleChildGuards.get(sessionID);
+    if (known !== undefined) return known;
+    const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+    const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
+    const attempt = callID === undefined ? undefined : roleAttempts.get(callID);
+    if (attempt === undefined) return undefined;
+    const routed: RoutedGuardInput = { agent: attempt.agent, tier: attempt.tier, routeBudget: attempt.routeBudget };
+    setBounded(roleChildGuards, sessionID, routed);
+    return routed;
+  };
+  /**
+   * Handoff 27: the guard profile of a role child — the role's budget for the tier it runs on, raised by the dispatch's `budget=`.
+   * QA-G-A3-3: both come from the ROUTED decision of the child's current dispatch (a resume's own tier and `budget=`); only a child
+   * without one (a delegate's unbound child, another instance's) falls back to the dispatch registry's tier (else the role's floor,
+   * its registered fallback model, P-1) and the bound dispatch budget.
+   */
+  const roleGuardProfileOf = (sessionID: unknown, agent: unknown): GuardProfile | undefined => {
+    const spec = roleSpecOf(agent) ?? roleOfSession(sessionID);
+    if (spec === undefined || typeof sessionID !== "string") return undefined;
+    const routed = routedGuardOf(sessionID);
+    let profile: GuardProfile;
+    if (routed !== undefined && routed.agent === spec.agent) {
+      profile = roleGuardProfile(spec, routed.tier, routed.routeBudget);
+    } else {
+      const record = lookupDispatch(sessionID);
+      const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
+      profile = roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
+    }
+    // QA-G-A3-2-2 (§2.6): the cumulative limit spans the child's rounds, so it follows the LARGEST round budget the child had
+    // (a later round with a smaller budget never shrinks it below what earlier rounds were allowed).
+    const peak = Math.max(roleBudgetPeaks.get(sessionID) ?? 0, profile.budget);
+    if (roleBudgetPeaks.get(sessionID) !== peak) setBounded(roleBudgetPeaks, sessionID, peak);
+    return { ...profile, cumulative: Math.max(profile.cumulative, peak * GUARD_CUMULATIVE_MULTIPLIER) };
+  };
+  /** Handoff 13 (P1.4 `run` signal): router-observed runs and edit times of role children, bounded per child and overall. */
+  const roleRuns = new Map<string, RunRecord[]>();
+  const roleEdits = new Map<string, number[]>();
+  /** QA-P21-1-7: role children that made a tool call while the router was bypassed (their edits were not recorded). */
+  const roleBypassedCalls = new Set<string>();
+  const noteBypassedRoleCall = (sessionID: unknown): void => {
+    if (typeof sessionID !== "string" || roleOfSession(sessionID) === undefined) return;
+    roleBypassedCalls.add(sessionID);
+    while (roleBypassedCalls.size > ROLE_STATE_MAX) roleBypassedCalls.delete(roleBypassedCalls.values().next().value!);
+  };
+  const pushBounded = <T>(map: Map<string, T[]>, key: string, value: T): void => {
+    const list = map.get(key) ?? [];
+    map.delete(key);
+    list.push(value);
+    while (list.length > 64) list.shift();
+    map.set(key, list);
+    while (map.size > ROLE_STATE_MAX) map.delete(map.keys().next().value!);
+  };
+  const ROLE_EDIT_TOOLS: ReadonlySet<string> = new Set(["edit", "write", "patch", "multiedit", "apply_patch"]);
+  /** Handoffs 16-18: the parent's role dispatches (by call), for the re-dispatch signal; bounded, oldest out. */
+  const roleDispatchTexts = new Map<string, DispatchText>();
+  /** IngestSettings.roleAgentIds from `resolveRoles` (handoff 21): the same object per base settings, so ingestion keeps its caches. */
+  const roleIngestSettings = new WeakMap<IngestSettings, IngestSettings>();
+  const withRoleAgents = (settings: IngestSettings | null): IngestSettings | null => {
+    const roles = rolesNow();
+    if (settings === null || roles.size === 0) return settings;
+    let extended = roleIngestSettings.get(settings);
+    if (extended === undefined) {
+      extended = Object.freeze({ ...settings, roleAgentIds: new Set(roles.keys()) });
+      roleIngestSettings.set(settings, extended);
+    }
+    return extended;
+  };
+  // M6 (2.1.3, QA-2.1-7): the one telemetry ingest of this plugin instance. v2 only (D1); every call is a no-op unless
+  // routing.engine != static. Verdicts and false refusals come from the hooks below; the v2 adapter receives this same
+  // instance through `routerOnIngest` and feeds it the step and session events, so there is a single settings source.
+  const ingestAbort = new AbortController();
+  const ingest: Ingest | undefined = ctx.routerHost === "v2" ? (() => {
+    const core = createIngest({
+      settings: () => withRoleAgents(ingestSettings(cfg, "v2")),
+      logger,
+      ...(ctx.routerCatalog
+        ? { pricing: createCatalogPricing(ctx.routerCatalog, { logger, cacheKey: ctx.directory, signal: ingestAbort.signal }) }
+        : {}),
+    });
+    // Disposing also releases any lookup still waiting for the catalog (QA-2.1-5): shutdown never waits for it.
+    return { ...core, dispose: async () => { ingestAbort.abort(); await core.dispose(); } };
+  })() : undefined;
+  if (ingest) ctx.routerOnIngest?.(ingest);
+  // Phase 2.3: what the delegate ladder tells the telemetry about each attempt (registry entry + decision row). v2 only (D1).
+  const attemptRecorder: AttemptRecorder | undefined = ctx.routerHost === "v2"
+    ? createAttemptRecorder({ host: "v2", config: () => cfg, logger })
+    : undefined;
+  resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
+  // #84 P2.1 (handoff 1): v1 + any roles key: the "roles delegation requires OpenCode v2" notice, once, at startup.
+  resolveRolesRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger);
+  const depthTracker = createDepthTracker({
+    async getParent(id) {
+      if (sessionRootMemo.get(id) === true) return null;
+      const res = await ctx.client.session.get({ path: { id } });
+      if (!res || (res as { error?: unknown }).error || !res.data) {
+        throw new Error("session.get returned no session data");
+      }
+      const parentID = res.data.parentID;
+      return typeof parentID === "string" && parentID !== "" ? parentID : null;
+    },
+    now: () => Date.now(),
+    logger: routerWarn,
+  });
+  const depthGuard = createDepthGuard({
+    tracker: depthTracker,
+    limit: () => resolveDepthLimit(cfg),
+    mode: (sid) => resolveEnforcementMode({
+      config: cfg,
+      tier: (typeof sid === "string" ? sessionStore.getTier(sid) : null) ?? undefined,
+      env: process.env,
+    }).mode,
+    logger: routerWarn,
+  });
+  const effortOverrides = createEffortOverrideStore({ logger: routerWarn });
+  let warnedGraderParams = false;
+  const depthBanners = new Map<string, string>();
+  const warnedNoCallID = new Set<string>();
+  const stashDepthBanner = (
+    input: { sessionID?: string; callID?: string },
+    output: Record<PropertyKey, unknown>,
+    banner: string,
+  ): void => {
+    try {
+      if (ctx.routerHost === "v2") {
+        output[DEPTH_BANNER] = banner;
+        return;
+      }
+      if (typeof input.callID === "string" && input.callID !== "") {
+        const key = `${input.sessionID}:${input.callID}`;
+        depthBanners.delete(key);
+        depthBanners.set(key, banner);
+        while (depthBanners.size > 1000) depthBanners.delete(depthBanners.keys().next().value!);
+      } else {
+        const sid = String(input.sessionID);
+        if (warnedNoCallID.has(sid)) return;
+        logger.warn(`[router] delegation depth: task call without callID in session ${sid}; advisory banner not delivered`);
+        warnedNoCallID.add(sid);
+        while (warnedNoCallID.size > 1000) warnedNoCallID.delete(warnedNoCallID.values().next().value!);
+      }
+    } catch (error) {
+      logger.warn("[router] delegation depth: advisory banner not stored", { error: describeError(error) });
+    }
+  };
+
+  const {
+    graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
+    prepareVerification, startReferenceGc,
+    sweepVerification, disposeVerification,
+    startDispatch, takeDispatch, isDeferred: wiringIsDeferred, finishDeferred, applyLineage, pending,
+    verifyHandles,
+    // 2.4.5: undefined unless `background: true` at plugin start (pending.ts R14).
+    background,
+  } = createVerificationWiring({
+    client: ctx.client,
+    childRunner: ctx.routerChildRunner,
+    onChildSessionCreated: (sid, creator) => depthTracker.recordPluginChild(sid, creator),
+    directory: ctx.directory,
+    getConfig: () => cfg,
+    logger,
+  });
+  // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
+  // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
+  // git child; dispose cancels it.
+  const stopReferenceGc = startReferenceGc();
+
+  // Best-effort, secret-free delegate scorecard dump (counts only).
+  const dumpDelegateScorecard = (
+    sid: string,
+    st: Parameters<typeof formatLadderScorecard>[0],
+    accepted: boolean,
+    method: string,
+  ): void => {
+    try {
+      const line = formatLadderScorecard(st, accepted, method);
+      const dir = join(tmpdir(), "opencode-model-router-trajectory");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${sid}.delegate.log`), line + "\n", { flag: "a" });
+    } catch {
+      // best-effort only
+    }
+  };
+
+  // Bypass mode: when true, the router skips all system prompt injection,
+  // subagent tracking, cap enforcement, and narration detection for the
+  // current plugin lifetime (i.e., until OpenCode is restarted).
+  let bypassed = false;
+  // #84 P2.1: the v2 adapter's role path reads the bypass state (the router gate does not run while bypassed, S10/P-9).
+  (ctx as RouterPluginInput & { routerOnBypassState?: (read: () => boolean) => void }).routerOnBypassState?.(() => bypassed);
+  /** QA-P21-1-3: the budget snapshot of a role child as the signals AND the adapter's budget notice read it (guard + read cap). */
+  const roleBudgetSnapshot = (childSessionID: string) => captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  (ctx as RouterPluginInput & { routerOnBudgetSnapshot?: (read: typeof roleBudgetSnapshot) => void }).routerOnBudgetSnapshot?.(roleBudgetSnapshot);
+  /**
+   * QA-G-A3-2 (§2.9 E6, R7 REFUSAL_CAP): a role child's call refused where the guard's before-hook never sees it — the v2
+   * adapter's role-authority check (thrown in its `execute.before`, before this plugin's hook) and host permission denials (its
+   * `execute.after` with a permission error) — counted on the child's guard state like the guard's own refusals, so `denied_cap`
+   * stops a child that keeps retrying refused actions. Returns the guard's text for the refusal (its stop, or the advisory
+   * banner), or undefined. Role children only; nothing while bypassed or when enforcement is off. Never throws.
+   */
+  const recordRoleRefusal = (sessionID: string, agent: string | undefined, tool: string, args: unknown): string | undefined => {
+    try {
+      if (bypassed) return undefined;
+      // A child whose first calls are all refused never reached the before-hook that marks it: as there, from its own agent.
+      if (rememberRoleSession(sessionID, agent)) sessionStore.markChildSession(sessionID);
+      if (roleOfSession(sessionID) === undefined || !sessionStore.isSubagent(sessionID)) return undefined;
+      const profile = roleGuardProfileOf(sessionID, agent);
+      return guardRefusedCall({
+        cfg,
+        tier: sessionStore.getTier(sessionID),
+        trivial: sessionStore.isTrivial(sessionID),
+        cap: sessionStore.getCap(sessionID),
+        sessionID,
+        tool,
+        toolArgs: args,
+        store: guardStore,
+        env: process.env,
+        ...(profile === undefined ? {} : { profile }),
+      });
+    } catch {
+      return undefined; // never break a real session on a guard-internal error
+    }
+  };
+  (ctx as RouterPluginInput & { routerOnRefusal?: (record: typeof recordRoleRefusal) => void }).routerOnRefusal?.(recordRoleRefusal);
+  /** #84 P2.1 (handoff 22): the v2 adapter's host-side budget observation of a role child (step limit, context overflow). */
+  const hostBudgetOf = (ctx as RouterPluginInput & {
+    routerHostBudget?: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation | undefined;
+  }).routerHostBudget;
+
+  warnConfigIssues(cfg, logger);
+
+  // Fetch and normalize opencode's live provider/model catalog. Best-effort:
+  // returns null when the client call fails, e.g. the server is not ready yet.
+  // The pure analysis (validateModels) lives in src/router/catalog.ts.
+  const fetchCatalogRaw = async (): Promise<{ catalog: Catalog; raw: unknown } | null> => {
+    try {
+      const res: any = await ctx.client.config.providers();
+      return { catalog: normalizeCatalog(res?.data), raw: res?.data };
+    } catch {
+      return null;
+    }
+  };
+  const fetchCatalog = async (): Promise<Catalog | null> => (await fetchCatalogRaw())?.catalog ?? null;
+
+  // M8 (Phase 2.4): the cost doctor reads the host's agents and model catalog (v2 only, D1). Each call is bounded and failing
+  // one only leaves the checks that need it silent; nothing here ever throws into a session.
+  // The orchestrator's model as the last root-session turn reported it: the host's title pick depends on its provider (QA-2.4-1).
+  let lastPrimary: { providerID: string; modelID: string | null } | null = null;
+  const ADVISOR_HOST_TIMEOUT_MS = 3_000;
+  // The catalog comes from `config.providers()` (the call `/router` already makes for the model check, enriched with cost and capabilities
+  // by the v2 adapter), so the doctor does not ask the host for the model list a second time (QA-2.4-3). `prefetched` is that call's result
+  // when the caller already has it.
+  /** #84 P2.2: the window of the decision log the roles checks of the cost doctor read. */
+  const ADVISOR_ROLE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+  /**
+   * #84 P2.2: the extras of the cost doctor's roles checks — the host and, in roles mode with a live engine, the role × tier
+   * statistics and the tier dispatch count of the decision log over {@link ADVISOR_ROLE_WINDOW_MS}. Tiers mode and v1 read nothing
+   * (`{ host }` only, which no tier check reads); a read failure leaves the statistics out, so those checks stay silent.
+   */
+  const advisorExtras = async (): Promise<AdvisorExtras> => {
+    const host = isV2Host ? "v2" as const : "v1" as const;
+    if (rolesNow().size === 0) return { host };
+    const live = ingestSettings(cfg, "v2");
+    if (live === null) return { host }; // engine static: no decision log
+    try {
+      const read = await createPersister(live.outcomesDir, nodePersistDeps({ warn: () => undefined })).readRows();
+      const since = Date.now() - ADVISOR_ROLE_WINDOW_MS;
+      return { host, roleStats: summarizeRoles(null, read.rows, { since, until: null }), tierDispatches: tierDispatchCount(read.rows, since) };
+    } catch (error) {
+      logger.warn("[router] cost doctor: the role statistics are unavailable", { error: describeError(error) });
+      return { host };
+    }
+  };
+  const gatherAdvisorInputs = async (
+    prefetched?: { raw: unknown } | null,
+  ): Promise<{ host: HostConfigView | null; catalog: AdvisorCatalogModel[] | null; extras: AdvisorExtras }> => {
+    const attempt = async <T>(label: string, call: (() => Promise<T>) | undefined): Promise<T | null> => {
+      if (call === undefined) return null;
+      try {
+        return await withTimeout(call(), ADVISOR_HOST_TIMEOUT_MS, label);
+      } catch (error) {
+        logger.warn(`[router] cost doctor: the ${label} is unavailable`, { error: describeError(error) });
+        return null;
+      }
+    };
+    const [agents, providers, extras] = await Promise.all([
+      attempt("host agent list", ctx.routerAgents),
+      prefetched !== undefined ? Promise.resolve(prefetched) : attempt("model catalog", fetchCatalogRaw),
+      advisorExtras(),
+    ]);
+    return {
+      host: agents === null ? null : hostConfigFromAgents(agents, lastPrimary),
+      catalog: providers === null ? null : catalogFromProviders(providers.raw),
+      extras,
+    };
+  };
+  const advisorNotifier = ctx.routerHost === "v2"
+    ? createAdvisorNotifier({ settings: () => advisorSettings(cfg, "v2", { project: projectDir }), config: () => cfg, gather: gatherAdvisorInputs, logger })
+    : undefined;
+  // `/annotate-plan` (Phase 2.4.4): its own engine runtime (agent list, catalog, classifier backend, outcome store), created on the first use
+  // and only on v2; with `routing.engine: static` its `prepare()` answers null before any host call, store or file.
+  let annotateRuntime: EngineRuntime | undefined;
+  const annotatePlanRuntime = (): EngineRuntime | undefined => {
+    if (ctx.routerHost !== "v2" || ctx.routerAgents === undefined || ctx.routerCatalog === undefined) return undefined;
+    annotateRuntime ??= createEngineRuntime({
+      loadConfig: () => cfg,
+      listAgents: ctx.routerAgents,
+      listModels: ctx.routerCatalog,
+      ...(ctx.routerGenerate === undefined ? {} : { generate: ctx.routerGenerate }),
+      logger,
+    });
+    return annotateRuntime;
+  };
+  // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()` and never fetched unless
+  // `routing.roles` is set explicitly. It is refreshed IN THE BACKGROUND (QA-2.4-13): a turn never waits for it. The first turn after start
+  // has no list yet and gets the baseline prompt; later turns use the last list, stale while the next one is fetched (every minute). A
+  // failed refresh keeps the last list and is logged; a list that was never fetched leaves the line as it is without roles.
+  const V1_AGENTS_TTL_MS = 60_000;
+  let v1Agents: { at: number; infos: HostAgentInfo[] | null } | null = null;
+  let v1AgentsRefresh: Promise<void> | null = null;
+  const refreshV1Agents = (): void => {
+    if (v1AgentsRefresh !== null) return;
+    const run = (async (): Promise<void> => {
+      try {
+        const res = await withTimeout(Promise.resolve(ctx.client.app.agents()), 2_000, "v1 agent list");
+        const data: unknown = (res as { data?: unknown } | undefined)?.data;
+        v1Agents = { at: Date.now(), infos: Array.isArray(data) ? v1AgentInfos(data) : (v1Agents?.infos ?? null) };
+      } catch (error) {
+        logger.warn("[router] routing.roles: the host's agent list is unavailable; the R: line keeps the last list, or stays without roles", { error: describeError(error) });
+        v1Agents = { at: Date.now(), infos: v1Agents?.infos ?? null }; // keep serving the stale list; try again after the interval
+      }
+    })().finally(() => {
+      if (v1AgentsRefresh === run) v1AgentsRefresh = null;
+    });
+    v1AgentsRefresh = run;
+  };
+  /** The last known v1 agent list (possibly stale, possibly `null`), starting a background refresh when it is due. Synchronous. */
+  const v1AgentsNow = (): HostAgentInfo[] | null => {
+    if (v1Agents === null || Date.now() - v1Agents.at >= V1_AGENTS_TTL_MS) refreshV1Agents();
+    return v1Agents?.infos ?? null;
+  };  /** Hand a notice to the orchestrator as a synthetic transcript entry (v2), or log it where there is no such call. Never throws, never waits. */
+  const deliverAdvisorNotice = (sessionID: string, notice: string): void => {
+    const synthetic = ctx.routerSynthetic;
+    if (synthetic === undefined) {
+      logger.warn(notice); // no synthetic-message call on this host: the log line is the whole delivery
+      return;
+    }
+    const text = `Cost doctor notice for the user (say it once, in one short sentence, then carry on with the task):\n${notice}`;
+    void Promise.resolve()
+      .then(() => synthetic({ sessionID, text, description: "Model router cost doctor" }))
+      .catch((error: unknown) => {
+        logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
+      });
+  };
+  /** The `/router` section "Cost doctor" (on demand: runs the checks now, writes nothing). */
+  const buildCostDoctorLines = async (prefetched?: { raw: unknown } | null): Promise<string[]> => {
+    const routing = resolveRouting(cfg, "v2");
+    if (!routing.advisor.enabled) return ["Cost doctor: disabled (routing.advisor.enabled is false)."];
+    const { host, catalog, extras } = await gatherAdvisorInputs(prefetched);
+    const lines = formatFindings(runAdvisor(cfg, host, catalog, logger, extras), {
+      hostKnown: host !== null,
+      catalogKnown: catalog !== null && catalog.length > 0,
+      primaryKnown: lastPrimary !== null,
+    });
+    // Phase 2.3 handoff (decision 16): a ladder row's confidence is not the evidence share the dispatch rows carry.
+    if (routing.engine !== "static") {
+      lines.push("Decision log: a ladder-attempt row's confidence is the delegation's class confidence; a dispatch row's is the class confidence scaled by the winner's evidence (n/(n+5)).");
+    }
+    return lines;
+  };
+
+  // Deferred passive catalog check. The first orchestrator turn only STARTS the
+  // fetch (fire-and-forget, never awaited on the chat.message hot path) and
+  // parks the result in a local; the warning is emitted on the first LATER turn
+  // that finds the promise already settled — normally turn 2. Deliberate
+  // tradeoff: a report-only diagnostic showing up one turn late costs nothing,
+  // while awaiting a network round-trip in front of every session's first
+  // message costs every user every session. No timers (banned in src/), and the
+  // continuation writes to a local variable only — it never touches an
+  // output.parts of a message the hook has already returned.
+  //
+  // Command handlers deliberately keep their own fresh fetchCatalog() call, so a
+  // turn-1 failure (server not ready yet) is never cached into `/router models`.
+  let catalogFetchStarted = false;
+  /** undefined = not started or still in flight; null = the fetch failed. */
+  let deferredCatalog: Catalog | null | undefined;
+  // One-shot guard so the passive warnings run at most once per plugin
+  // lifetime; re-validate on demand with /router.
+  let catalogWarned = false;
+
+  const startCatalogFetch = (): void => {
+    if (catalogFetchStarted) return;
+    catalogFetchStarted = true;
+    // fetchCatalog already swallows its own errors; the .catch is belt-and-
+    // braces so this fire-and-forget promise can never reject unhandled.
+    void fetchCatalog()
+      .then((c) => {
+        deferredCatalog = c;
+      })
+      .catch(() => {
+        deferredCatalog = null;
+      });
+  };
+
+  const enableDelegateTool =
+    cfg.experimental?.verifiedDelegateTool === true ||
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
+
+  // 2.4.3b (plan 2.4.3 "Registration"): `router_verify` is registered whenever verification is
+  // enabled at plugin start, independent of enableDelegateTool: verify.require is not "never" and
+  // a verifying path exists (the native `task` path needs an enforcement mode other than "off";
+  // the delegate tool verifies in every mode). The tool map is fixed at start.
+  let routerVerifyEnabled = false;
+  try {
+    const startMode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+    routerVerifyEnabled = cfg.enforcement?.verify?.require !== "never" && (startMode !== "off" || enableDelegateTool);
+  } catch (error) {
+    logger.warn("[verify] router_verify not registered: the enforcement mode could not be resolved", { error: scrubText(String(error)) });
+  }
+  // QA-P21-2 nit 3: the role path's deferral check follows it (nothing is deferred without router_verify).
+  (ctx as RouterPluginInput & { routerOnVerifyEnabled?: (read: () => boolean) => void }).routerOnVerifyEnabled?.(() => routerVerifyEnabled);
+  /**
+   * 2.4.2 + 2.4.3b: a delegation defers only when `router_verify` exists to verify it later. A
+   * footer never names a tool this instance did not register; without it the delegation keeps the
+   * synchronous gate (never weaker).
+   */
+  const isDeferred: typeof wiringIsDeferred = (dod, directives, trivial) => routerVerifyEnabled && wiringIsDeferred(dod, directives, trivial);
+  /**
+   * QA-2.4-2: a deferred entry is keyed to the dispatching session (pending.ts R6), and only a root
+   * orchestrator ever sees a pending list (the system transform returns early for every child). So
+   * only a PROVEN root orchestrator session may defer. A subagent dispatching `task` or `delegate`
+   * (a grader, a tracked subagent, a session with a parentID) gets today's synchronous gate and
+   * registers nothing, whatever its directives say; so does an unknown session (no id, or a failed
+   * lookup: fail safe).
+   */
+  const isProvenRootCaller = async (sessionID: unknown): Promise<boolean> => {
+    if (typeof sessionID !== "string" || sessionID === "") return false;
+    if (graderSessions.has(sessionID) || sessionStore.isSubagent(sessionID)) return false;
+    return (await lookupRootSession(sessionID)) === true;
+  };
+
+  /**
+   * Phase 2.3: the host model catalog as the delegate ladder reads it (variants and limits per model). Best effort: a
+   * missing, failing or slow catalog is `undefined`, and the ladder then behaves exactly as without variant info
+   * (fresh sessions, tier ratios). QA-2.3-3: the answer, positive or negative, is cached for the TTL; delegations that
+   * ask while a load is running share it; a call that outlived its timeout is not repeated behind itself (a late answer
+   * still fills the cache); and a failure is logged once per streak, until a load succeeds. So with a hung catalog the
+   * first delegation waits for the timeout and every later one answers at once.
+   */
+  /** How long a failed ladder attempt waits for its child's execution end before it starts fresh (QA-2.3-2). */
+  const RESUME_END_WAIT_MS = 1_000;
+  const RUNNER_CATALOG_TTL_MS = 15_000;
+  const RUNNER_CATALOG_TIMEOUT_MS = 3_000;
+  /** A catalog call still pending after this long is abandoned: a new one may start behind it. */
+  const RUNNER_CATALOG_ABANDON_MS = 60_000;
+  /** The last answer, valid for the TTL; `lookup` undefined = the catalog was unavailable. */
+  let runnerCatalog: { at: number; lookup: CatalogLookup | undefined } | undefined;
+  /** The load in progress (bounded by the timeout), shared by every delegation that asks meanwhile. */
+  let runnerCatalogLoad: Promise<CatalogLookup | undefined> | undefined;
+  /** When the outstanding `routerCatalog()` call started; it may outlive its timeout. */
+  let runnerCatalogCallAt: number | undefined;
+  /** Id of the latest call (QA-2.3-R2-6): an abandoned call that settles late must not clear the state of a newer one. */
+  let runnerCatalogCallId = 0;
+  let runnerCatalogFailing = false;
+  const runnerCatalogFailed = (error: unknown): undefined => {
+    runnerCatalog = { at: Date.now(), lookup: undefined };
+    if (!runnerCatalogFailing) {
+      runnerCatalogFailing = true;
+      logger.warn("[router] ladder: the model catalog is unavailable; variant steps and resume are off until it answers", { error: describeError(error) });
+    }
+    return undefined;
+  };
+  const loadRunnerCatalog = (): Promise<CatalogLookup | undefined> => {
+    const list = ctx.routerCatalog;
+    if (!list) return Promise.resolve(undefined);
+    const nowMs = Date.now();
+    if (runnerCatalog !== undefined && nowMs - runnerCatalog.at < RUNNER_CATALOG_TTL_MS) return Promise.resolve(runnerCatalog.lookup);
+    if (runnerCatalogLoad !== undefined) return runnerCatalogLoad;
+    if (runnerCatalogCallAt !== undefined && nowMs - runnerCatalogCallAt < RUNNER_CATALOG_ABANDON_MS) {
+      // An earlier call timed out and is still outstanding: no second `list()` behind it.
+      runnerCatalog = { at: nowMs, lookup: undefined };
+      return Promise.resolve(undefined);
+    }
+    runnerCatalogCallAt = nowMs;
+    const callId = ++runnerCatalogCallId;
+    const answer = Promise.resolve().then(() => list()).then(
+      (models) => {
+        // A late answer is still a catalog, whichever call it answers; only the latest call owns the marker.
+        if (callId === runnerCatalogCallId) runnerCatalogCallAt = undefined;
+        const lookup = createCatalogLookup(models);
+        runnerCatalog = { at: Date.now(), lookup };
+        runnerCatalogFailing = false;
+        return lookup;
+      },
+      (error: unknown) => {
+        // A failure of an abandoned call says nothing about the newer one: leave its marker and the cache alone.
+        if (callId !== runnerCatalogCallId) return undefined;
+        runnerCatalogCallAt = undefined;
+        return runnerCatalogFailed(error);
+      },
+    );
+    const load: Promise<CatalogLookup | undefined> = withTimeout(answer, RUNNER_CATALOG_TIMEOUT_MS, "model catalog")
+      .catch((error: unknown) => runnerCatalogFailed(error))
+      .finally(() => {
+        if (runnerCatalogLoad === load) runnerCatalogLoad = undefined;
+      });
+    runnerCatalogLoad = load;
+    return load;
+  };
+
+  // #84 P2.1 (T2.1.3): the tools of roles mode. The tool map is fixed at plugin start (like `router_verify`): in tiers mode and on
+  // v1 the set is exactly the previous one (router_run and router_request_authority are not registered; router_git_* keep their
+  // directory resolution). Switching to roles mode registers them on the next start.
+  const rolesAtStart = rolesNow().size > 0;
+  const dynamicRolesAtStart = [...rolesNow().values()].some((spec) => spec.authority.mode === "dynamic");
+  /** `router_request_authority` dependencies (P1.6): the role by child session; only the parent of `dispatchOf` is read. */
+  const authorityDeps = {
+    roleOf: (child: string) => roleOfSession(child),
+    roles: () => rolesNow(),
+    dispatchOf: (child: string) => {
+      const parent = lookupDispatch(child)?.parentSessionID;
+      // QA-P21-1-13: `callID: ""` = not attached yet. authority.ts reads only the parent (to drop the request with it);
+      // `markAnnotated` attaches the request to the parent's call in the adapter's execute.after.
+      return typeof parent === "string" && parent !== "" ? { parentSessionID: parent, callID: "" } : undefined;
+    },
+    bindingOf: (child: string) => currentBinding(child, { maxOf: roleMaxOf }),
+  };
+  /** Exact npm forms of a deterministic check's command → the `routing.run` script it names (`npm test`, `npm run <name>`). */
+  const NPM_SCRIPT_RE = /^npm(?:\.cmd)?\s+(?:(test|t)|run(?:-script)?\s+([A-Za-z0-9_][A-Za-z0-9_.:@+-]*))$/;
+  /** The acceptance commands of a role dispatch as `routing.run` names (handoff 13): only exact npm script forms count. */
+  const acceptanceScripts = (prompt: unknown, description: unknown): string[] => {
+    const dod = buildDelegationDoD({
+      prompt: typeof prompt === "string" ? prompt : undefined,
+      description: typeof description === "string" ? description : undefined,
+    });
+    if (dod.kind !== "deterministic") return [];
+    return dod.checks.flatMap((check) => {
+      const match = typeof check.command === "string" ? NPM_SCRIPT_RE.exec(check.command.trim()) : null;
+      return match === null ? [] : [match[1] !== undefined ? "test" : (match[2] as string)];
+    });
+  };
+  /**
+   * QA-P21-2-3: the read-only cap a role dispatch asks for itself — `CAP:N`, or `CAP:none` with a `reason:` line (an unjustified
+   * `CAP:none` is no cap, as for tier dispatches); `null` when it names none (then the child gets no read-only cap).
+   */
+  const roleDispatchCap = (prompt: unknown): Cap | null => {
+    if (typeof prompt !== "string") return null;
+    const parsed = parseCapDirective(prompt);
+    return parsed === "none" && !/\breason:/i.test(prompt) ? null : parsed;
+  };
+  /** Caps of fresh role dispatches, by the parent's call, until the child binds (bounded, oldest out). */
+  const pendingRoleCaps = new Map<string, { agent: string; cap: Cap }>();
+  const rememberPendingRoleCap = (callID: string, agent: string, cap: Cap): void => {
+    pendingRoleCaps.delete(callID);
+    pendingRoleCaps.set(callID, { agent, cap });
+    while (pendingRoleCaps.size > ROLE_STATE_MAX) pendingRoleCaps.delete(pendingRoleCaps.keys().next().value!);
+  };
+  /**
+   * The role child's read-only counter with the dispatch's cap, independent of `subagentTiers` (the session store's producer
+   * registration: no trivial downgrade). The cap is keyed by the role agent's name, which is never a tier.
+   */
+  const registerRoleCap = (child: string, agent: string, cap: Cap): void => {
+    sessionStore.registerProducerSession(child, agent, { ...cfg, tierCaps: { ...(cfg.tierCaps ?? {}), [agent]: cap } } as RouterConfig);
+  };
+  /** A fresh role child's first call: its exact binding names the dispatch's call, whose cap is registered once. */
+  const applyPendingRoleCap = (child: string): void => {
+    if (pendingRoleCaps.size === 0) return;
+    const binding = currentBinding(child, { maxOf: roleMaxOf });
+    const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
+    const pending = callID === undefined ? undefined : pendingRoleCaps.get(callID);
+    if (callID === undefined || pending === undefined) return;
+    pendingRoleCaps.delete(callID);
+    registerRoleCap(child, pending.agent, pending.cap);
+  };
+  /**
+   * #84 P3.3 DF2-F1: where the `task` call `callID` is verified. A routed role dispatch (`routedRoleOf`, kept until the adapter's
+   * `execute.after` is done) in its `verifyRoot` — the grant's work root (a resume keeps the child's bound root, QA-P33F1-1-1), else
+   * its canonical session directory (QA-P33F1-1-3); the requested cwd (`requestedVerificationCwd`: the call's `cwd`, else the
+   * block's `cwd:`, the order the dispatch-time detection uses, nit 3) still wins inside it, by P2.3's rule (QA-P33F1-1-2); one
+   * outside it is refused by the gate. Every other dispatch: the explicit cwd, as before (I1).
+   */
+  const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }): VerificationScope =>
+    verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), typeof callID === "string" ? routedRoleOf(callID)?.verifyRoot : undefined);
+  /** The prompt as the orchestrator wrote it: without the router's nonce line (handoff 18; role dispatches carry no header). */
+  const withoutNonceLine = (prompt: string): string => prompt.replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
+  /**
+   * The parent's `task` call of a routed role dispatch (before it runs): a resume opens a new guard round for the child (its
+   * budget and `budgetExhausted` are per round), and the re-dispatch signal (P1.4, handoff 16) compares the dispatch with the
+   * parent's earlier role dispatches: a failure lands on the previous attempt, addressed by its decision id.
+   */
+  const noteRoleDispatch = (callID: string, parentSessionID: string, args: Record<string, unknown>): void => {
+    const routed = routedRoleOf(callID);
+    if (routed === undefined || routed.parentSessionID !== parentSessionID) return;
+    // QA-G-B-5: the attempt starts now. QA-G-A3-3: the routed tier and `budget=` guard its child — a resume's at once (its new
+    // guard round takes them), a fresh child's once it binds to this call.
+    const guard: RoutedGuardInput = { agent: routed.agent, tier: routed.tier, routeBudget: routed.routeBudget };
+    setBounded(roleAttempts, callID, { ...guard, at: Date.now() });
+    if (routed.resumeID !== null) {
+      // QA-G-A3-2-2 (§2.6): a resume that names no `budget=` keeps the child's previous routed `budget=` (raise-only, applied to
+      // the resume's own tier); one that names a `budget=` takes its own.
+      const previous = routedGuardOf(routed.resumeID);
+      const inherited = routed.routeBudget ?? (previous?.agent === routed.agent ? previous.routeBudget : null);
+      setBounded(roleChildGuards, routed.resumeID, { ...guard, routeBudget: inherited });
+      guardStore.beginDispatch(routed.resumeID);
+    }
+    // QA-P21-2-3: the dispatch's own read-only cap. A resume names its child: registered now; a fresh child when it binds.
+    // QA-P21-3-1: every routed resume starts a new round of the child's read counter (the previous cap kept unless it names one),
+    // so a "continue and finish" resume after a CAP stop does not inherit the exhausted counter.
+    const cap = roleDispatchCap(args.prompt);
+    if (routed.resumeID !== null) {
+      if (!sessionStore.resumeRoleSession(routed.resumeID, cap) && cap !== null) registerRoleCap(routed.resumeID, routed.agent, cap);
+    } else if (cap !== null) {
+      rememberPendingRoleCap(callID, routed.agent, cap);
+    }
+    if (routed.decisionID === null) return; // engine static: no rows
+    const current: DispatchText = {
+      decisionID: routed.decisionID,
+      parentSessionID,
+      childSessionID: routed.resumeID,
+      class: routed.class,
+      role: routed.agent,
+      prompt: withoutNonceLine(typeof args.prompt === "string" ? args.prompt : ""),
+      tier: routed.tier,
+      at: Date.now(),
+      resume: routed.resumeID !== null,
+    };
+    const match = detectRedispatch(current, [...roleDispatchTexts.values()], roleTierOrder(cfg));
+    if (match !== null && match.previous.childSessionID !== null) {
+      ingest?.onSignal?.(match.previous.childSessionID, match.observation, { expectDecisionID: match.previous.decisionID });
+    }
+    roleDispatchTexts.delete(callID);
+    roleDispatchTexts.set(callID, current);
+    while (roleDispatchTexts.size > 200) roleDispatchTexts.delete(roleDispatchTexts.keys().next().value!);
+  };
+  /**
+   * The parent's `task` call of a role child returned (P1.4, handoffs 15-17, 23): the return signal with the REAL guard state
+   * (budget: the guard's enforced stop, or a `NEED MORE: budget` return the guard backs — QA-G-A3-1; `unobserved` when the guard
+   * never tracked the child; authority: the child's recorded request for this call), the router-observed run signal of THIS
+   * attempt (QA-G-B-5), and the dispatch text's end state for later re-dispatch checks.
+   * Verdict rows stay with `onVerdict`.
+   */
+  const observeRoleReturn = (callID: string, args: Record<string, unknown>, output: unknown): void => {
+    const { finalReturnText, childSessionID } = parseTaskResult(output);
+    const spec = childSessionID ? roleOfSession(childSessionID) ?? roleSpecOf(args.subagent_type) : undefined;
+    if (!childSessionID || spec === undefined) return;
+    rememberRoleSession(childSessionID, spec.agent);
+    // QA-P21-1-3: the snapshot includes the read-only CAP state. QA-P21-3-1: a reached read cap is a budget stop only when the
+    // child says so (`NEED MORE`, as the gate's claim check): a `DONE` or an unrelated `ESCALATE` at the cap is not one.
+    const snapshot = roleBudgetSnapshot(childSessionID);
+    const capStop = snapshot.readCapReached === true && parseReturnPrefix(finalReturnText)?.prefix === "need-more";
+    // QA-G-A3-1 (I7): advisory mode (the default) never enforces a stop; a `NEED MORE: budget` return of a tracked child whose
+    // budget or refusals are used up is a budget stop all the same — the gate's rule for honouring the claim (claimHonoured).
+    const claimStop = budgetClaimObserved(finalReturnText, snapshot);
+    // Handoff 22: the guard's stop folded with the host's own (step limit, context overflow), as the v2 adapter observed them.
+    const budgetObserved = foldBudgetObservation(
+      capStop || claimStop ? true : snapshot.tracked ? snapshot.stopped : "unobserved",
+      hostBudgetOf?.(childSessionID, roleAgentSteps(spec)),
+    );
+    const request = requestedAuthority(childSessionID);
+    const authorityObserved = request !== undefined && (!request.annotated || request.callID === callID);
+    const signal = returnSignal({ text: finalReturnText, budgetExhausted: budgetObserved, authorityRequested: authorityObserved });
+    if (signal !== null) ingest?.onSignal?.(childSessionID, signal);
+    const run = runSignal({
+      childSessionID,
+      runs: roleRuns.get(childSessionID) ?? [],
+      // QA-P21-1-7: a child that made any tool call while the router was bypassed has unrecorded edits.
+      editsObserved: !roleBypassedCalls.has(childSessionID),
+      edits: roleEdits.get(childSessionID) ?? [],
+      acceptance: acceptanceScripts(args.prompt, args.description),
+      // QA-G-B-5: only this attempt's runs count (an earlier attempt's run of the same child is that attempt's evidence). An
+      // attempt this instance did not note has no known start: NaN, so it gets no run signal (I6: never unscoped evidence).
+      since: roleAttempts.get(callID)?.at ?? Number.NaN,
+    });
+    if (run !== null) ingest?.onSignal?.(childSessionID, run);
+    const sent = roleDispatchTexts.get(callID);
+    if (sent !== undefined) {
+      roleDispatchTexts.set(callID, {
+        ...sent,
+        childSessionID: sent.childSessionID ?? childSessionID,
+        endedAt: Date.now(),
+        returnPrefix: parseReturnPrefix(finalReturnText)?.prefix ?? null,
+        returned: signal?.kind === "budget" || signal?.kind === "authority" ? signal.kind : null,
+        budgetExhausted: budgetObserved,
+        authorityRequested: authorityObserved,
+      });
+    }
+  };
+  /** Forget a deleted session's role state (as a child, and as the parent of role dispatches). */
+  const forgetRoleSession = (sessionID: string): void => {
+    roleSessions.delete(sessionID);
+    roleRuns.delete(sessionID);
+    roleEdits.delete(sessionID);
+    roleBypassedCalls.delete(sessionID);
+    roleChildGuards.delete(sessionID);
+    roleBudgetPeaks.delete(sessionID);
+    for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
+  };
+  return {
+    // Warnings post to /log fire-and-forget, which loses the message when the
+    // process is about to exit — `opencode run` and `opencode debug` are short
+    // enough for that to be the normal case. Verified against opencode 1.18.16
+    // that dispose is both called and awaited, so flushing here is enough.
+    dispose: async () => {
+      stopReferenceGc();
+      // Stop new advisor work and finish state/claim writes and lock removal before teardown.
+      await advisorNotifier?.dispose();
+      // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
+      background?.dispose();
+      // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).
+      pending.dispose();
+      // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
+      await disposeVerification();
+      // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
+      await ingest?.dispose();
+      await annotateRuntime?.dispose();
+      await attemptRecorder?.dispose();
+      await logger.flush();
+    },
+    tool: {
+      // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
+      ...gitTools(rolesAtStart ? { resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}) } : {}),
+      // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
+      ...(rolesAtStart ? {
+        router_run: routerRunTool({
+          config: () => resolveRolesRouting(cfg, "v2").run,
+          resolveWorkRoot: resolveWorkRootFor("router_run"),
+          recordRun: (run) => pushBounded(roleRuns, run.sessionID, run),
+        }),
+      } : {}),
+      // #84 P2.1: the authority ladder (P1.6) for dynamic roles (`general`).
+      ...(rolesAtStart && dynamicRolesAtStart ? { router_request_authority: authorityTool(authorityDeps) } : {}),
+      ...(enableDelegateTool ? { delegate: tool({
+        description: DELEGATE_TOOL_DESCRIPTION,
+        args: {
+          task: tool.schema
+            .string()
+            .describe("The task for the subagent to perform."),
+          tier: tool.schema
+            .string()
+            .optional()
+            .describe("fast | medium | heavy. Defaults to the router default tier."),
+          acceptance: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Optional [acceptance]...[/acceptance] block defining the Definition of Done (check: / criteria: / deliverable: directives).",
+            ),
+          cwd: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Optional working directory used to VERIFY the result: relative check paths resolve against it and the grader session runs in it. It does NOT scope the producer subagent, so the task text must still tell the producer where to work.",
+            ),
+        },
+        async execute(
+          args: {
+            task: string;
+            tier?: string;
+            acceptance?: string;
+            cwd?: string;
+          },
+          toolCtx?: { sessionID?: string; abort?: AbortSignal },
+        ): Promise<string> {
+          // Every ladder iteration creates its own producer session. Tracked out
+          // here (not inside the try) so the finally below can dispose any that an
+          // early return or a throw skipped — otherwise each retry leaks another.
+          const producerSessions: string[] = [];
+          let baselineID: string | undefined;
+          /** 2.4.2c: the directives and start time of this delegation, from its first attempt. */
+          let dispatchStart: DispatchStart | undefined;
+          /**
+           * 2.4.2c: finishDeferred clears the dispatch record (baselineID) once its reference
+           * settled; clearing it in the finally below would abort a capture still in flight.
+           */
+          let deferredOwnsBaseline = false;
+          const depth = bypassed ? undefined : await depthGuard.checkDispatch(toolCtx?.sessionID);
+          if (depth?.block) {
+            try {
+              // Known subagents are counted by the normal after-hook: delegate
+              // returns a refusal rather than throwing (unlike native task).
+              if (typeof toolCtx?.sessionID === "string" && !sessionStore.isSubagent(toolCtx.sessionID)) {
+                trajectoryStore.recordToolEvent(toolCtx.sessionID, { tool: "delegate", readOnly: false, blocked: true });
+              }
+            } catch {
+              // Best-effort observation must never lose the depth refusal.
+            }
+            return depth.message!;
+          }
+          const withDepthBanner = (text: string): string => {
+            if (!depth?.banner) return text;
+            const trimmed = text.trimEnd();
+            return trimmed ? `${trimmed}\n\n${depth.banner}` : depth.banner;
+          };
+          try {
+            let activeCfg = cfg;
+            try {
+              activeCfg = loadConfig(projectDir);
+              warnConfigIssues(activeCfg, logger);
+            } catch {
+              activeCfg = cfg;
+            }
+            const initialTier =
+              typeof args.tier === "string" && args.tier.trim()
+                ? args.tier.trim()
+                : activeCfg.defaultTier || "medium";
+            const dod = buildDelegationDoD({
+              prompt: args.task,
+              acceptance: args.acceptance,
+            });
+            const effectiveCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd : dod.cwd;
+
+            // Phase 2.3 (D10/D11): on v2 with `variantSteps: auto` (A15: only with a `routing` block) and a catalog,
+            // the ladder is session-aware: variant steps on the same model first, resume of the child session
+            // under the context threshold. Anything else keeps the policy exactly as before (no variants key).
+            const host = ctx.routerHost === "v2" ? "v2" : "v1";
+            const variantMode = resolveVariantSteps(activeCfg, host);
+            const catalog = host === "v2" && ctx.routerChildRunner && variantMode === "auto" ? await loadRunnerCatalog() : undefined;
+            const policy = buildEscalatePolicy(
+              activeCfg,
+              catalog === undefined
+                ? undefined
+                : {
+                    host,
+                    variantSteps: variantMode,
+                    maxContextFraction: resolveRouting(activeCfg, host).sessionReuse.maxContextFraction,
+                    catalog,
+                    warn: (message) => logger.warn(message),
+                  },
+            );
+            const sessionAware = policy.variants != null;
+            let state = newLadderState(initialTier, policy);
+            const tiersForCost: any = getActiveTiers(activeCfg);
+            // A17 / QA-1.5-20: the first attempt runs the start tier's base rung; every later one charges its action's rung.
+            let rungCost: number | undefined = startCostRatio(policy, state);
+            let plan: AttemptPlan = planFirstAttempt(activeCfg, state.currentTier);
+            // Registry entry + decision row per attempt: for the ladder's own resume decision (the child's last step
+            // context) and for the outcome store. Without a routing block both are off and nothing is registered.
+            const recording = attemptRecorder !== undefined && (sessionAware || attemptRecorder.engineLive(activeCfg));
+            const delegation: DelegationFacts | null = recording
+              ? await classifyDelegation(activeCfg, host, args.task, args.acceptance, logger)
+              : null;
+
+            // Independent safety net: even a policy bug cannot loop unbounded.
+            const safetyMax =
+              Math.max(
+                policy.maxTotalAttempts,
+                policy.ladder.length * (policy.maxAttemptsPerTier + 1),
+              ) + 2;
+            let safety = 0;
+
+            let producerText = "";
+            let forcing: string | null = null;
+
+            /**
+             * One turn of the escalation ladder: create a producer session, run
+             * the task on it, put the result through the acceptance gate, then
+             * tear the session down. Returns null when the backend refused to
+             * create a session, the one failure the caller cannot retry.
+             *
+             * Split out because the loop is about when to *stop* — safety net,
+             * attempt accounting, tier advancement — and a ninety-line attempt
+             * in the middle of it obscured both halves.
+             */
+            const runProducerAttempt = async (
+              attemptPlan: AttemptPlan,
+              forcingNote: string | null,
+            ): Promise<{
+              sessionID: string;
+              text: string;
+              gateRes: Awaited<ReturnType<typeof accept>>;
+              /** The producer errored or timed out: its context is not trusted for a resume (D11). */
+              producerFailed: boolean;
+              confirmProducer?: () => void;
+            } | {
+              sessionID: string;
+              text: string;
+              /** 2.4.2c: deferred; the section 1.5-16 footer to append to the result. */
+              deferredFooter: string;
+            } | null> => {
+              const tier = attemptPlan.tier;
+              const effort = attemptPlan.effort;
+              const taskText = forcingNote
+                ? `${scrubText(forcingNote)}\n\n${args.task}`
+                : args.task;
+
+              let producerSid: string | undefined;
+              /** The child this attempt actually runs on; a resume the host refuses starts a fresh one instead. */
+              let resumeTarget: string | undefined = attemptPlan.resumeSessionID;
+              let confirmProducer: (() => void) | undefined;
+              const registerProducer = async (sid: string) => {
+                producerSid = sid;
+                if (!producerSessions.includes(sid)) producerSessions.push(sid);
+                depthTracker.recordPluginChild(sid, toolCtx?.sessionID ?? null);
+                if (effort !== undefined) {
+                  const tierCfg = getActiveTiers(activeCfg)[tier];
+                  // The D10 fallback (an invalid variant) delivers the step's effort through the override on a bare
+                  // model, so the override's tier carries that effort and no variant (effortCeilingFor needs both).
+                  if (tierCfg) effortOverrides.set(sid, tier, attemptPlan.fresh === "invalid-variant" ? { ...tierCfg, variant: undefined, effort } : tierCfg, effort);
+                }
+                // Phase 2.3: a distinct attempt in the dispatch registry (with its step label) and, when the engine is
+                // live, a decision row. Register before the first step; a resume's row waits for host identity confirmation.
+                if (recording && delegation !== null) {
+                  confirmProducer = attemptRecorder?.record({
+                    childSessionID: sid,
+                    parentSessionID: toolCtx?.sessionID ?? null,
+                    plan: attemptPlan,
+                    config: activeCfg,
+                    facts: delegation.facts,
+                    acceptance: delegation.acceptance,
+                    resumed: sid === resumeTarget,
+                  }, ctx.routerChildRunner !== undefined && sid === resumeTarget);
+                }
+                // Keep the ORIGINAL dispatch reference across retries/escalations:
+                // recapturing after a failed attempt would excuse its regression.
+                if (!baselineID) {
+                  baselineID = sid;
+                  // Capture before the child gets its first prompt, on either API.
+                  dispatchStart = await startDispatch(changedFileStore, baselineID, effectiveCwd, dod, args.task, false);
+                }
+                // Compose with Layer 1: guard the plugin-created producer session.
+                try {
+                  sessionStore.registerProducerSession(sid, tier, activeCfg);
+                } catch {
+                  // non-fatal
+                }
+              };
+              if (!ctx.routerChildRunner) {
+                const created: any = await ctx.client.session.create({
+                  body: {
+                    ...(toolCtx?.sessionID ? { parentID: toolCtx.sessionID } : {}),
+                  },
+                });
+                const sid: string | undefined = created?.data?.id;
+                if (!sid) return null;
+                await registerProducer(sid);
+              }
+
+              const model = tierModel(activeCfg, tier) ?? undefined;
+              if (sessionAware && attemptPlan.step !== "dispatch") {
+                // D11: the decision and both numbers are in the decision row (engine != static). The log line is for
+                // anomalies (QA-2.3-4): a fresh start nobody chose (unknown context, no budget, an invalid catalog
+                // variant). The routine ones are only logged with the existing opt-in debug flag: a resume, a start over
+                // the threshold, and the two conservative overrides that the shipped presets hit on every escalation
+                // (`effort-path`, `bare-model-after-variant`; QA-2.3-R2-2).
+                const basis = attemptPlan.resumeBasis;
+                const routine =
+                  resumeTarget !== undefined ||
+                  basis?.reason === "at-or-over-threshold" ||
+                  attemptPlan.fresh === "effort-path" ||
+                  attemptPlan.fresh === "bare-model-after-variant";
+                if (!routine || process.env.MODEL_ROUTER_TRAJECTORY_DEBUG === "1") {
+                  logger.warn(
+                    `[router] ladder ${attemptPlan.step} on ${tier}: ${resumeTarget !== undefined ? "resuming the child session" : "fresh child session"}` +
+                    `${basis ? ` (${basis.reason}; tokens=${basis.tokens} budget=${basis.budget} threshold=${basis.threshold})` : ""}` +
+                    `${attemptPlan.fresh ? `; runner: ${attemptPlan.fresh}` : ""}`,
+                  );
+                }
+              }
+              let producerText = "";
+              // Provider-failover vs quality-escalation precedence (Phase 3.3):
+              // Provider-failover is advisory only — a text chain injected into the orchestrator
+              // system prompt (buildFallbackInstructions). It is orthogonal to this runtime ladder.
+              // A transport/API error here becomes an explicit failed attempt and is treated as
+              // exactly ONE failed attempt by the quality-escalation ladder (no provider swap, no
+              // double-counted attempt). API error => (advisory) provider failover; verification
+              // FAIL => (runtime) quality escalation.
+              //
+              // The prompt is time-boxed: a model that never answers would
+              // otherwise hang the delegate forever. A timeout is folded into
+              // the same failed-attempt path as any other producer error — it
+              // is never an empty artefact that a lenient DoD could pass.
+              let producerError: string | null = null;
+              const childAbort = ctx.routerChildRunner ? new AbortController() : undefined;
+              try {
+                const runChild = (resume: string | undefined) => ctx.routerChildRunner!.run({
+                  parentSessionID: toolCtx?.sessionID,
+                  agent: attemptPlan.agent,
+                  model: attemptPlan.model,
+                  prompt: taskText,
+                  signal: childAbort!.signal,
+                  ...(resume === undefined ? {} : { resumeSessionID: resume }),
+                  onCreated: registerProducer,
+                  ...(resume === undefined ? {} : {
+                    onConfirmed: async (sid: string) => { if (sid === producerSid) confirmProducer?.(); },
+                  }),
+                });
+                const res: any = await withTimeout<unknown>(
+                  ctx.routerChildRunner ? (async () => {
+                    try {
+                      return await runChild(resumeTarget);
+                    } catch (error) {
+                      // D11 fallback: a resume the host side refuses before anything ran (the child is gone, or is not
+                      // ours) is not a failed attempt: the same attempt starts on a fresh child.
+                      if (resumeTarget === undefined || !(error instanceof ResumeRejectedError)) throw error;
+                      logger.warn(`[router] ladder ${attemptPlan.step} on ${tier}: ${error.message}; starting a fresh child session`);
+                      const refused = resumeTarget;
+                      resumeTarget = undefined;
+                      await disposeChildSession(refused);
+                      return await runChild(undefined);
+                    }
+                  })() : ctx.client.session.prompt({
+                    path: { id: producerSid! },
+                    body: {
+                      ...(model ? { model } : {}),
+                      ...(tier ? { agent: tier } : {}),
+                      parts: [{ type: "text", text: taskText }],
+                    },
+                  }),
+                  timeoutMs(
+                    activeCfg.enforcement?.verify?.delegateTimeoutMs,
+                    DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
+                  ),
+                  "delegate producer prompt",
+                );
+                producerText = ctx.routerChildRunner ? res.text : extractAssistantText(res);
+              } catch (error) {
+                producerError =
+                  error instanceof Error ? error.message : String(error);
+                producerText = "";
+              } finally {
+                childAbort?.abort();
+              }
+              if (!producerSid || !baselineID) return null;
+              // pending.ts R11: the producer's changes landed by now.
+              const returnedAt = Date.now();
+
+              // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
+              // that failed outright produced nothing to verify later; it keeps today's
+              // failed-attempt path, which runs no verification process either.
+              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives) &&
+                await isProvenRootCaller(toolCtx?.sessionID)
+                ? await finishDeferred(changedFileStore, {
+                    dispatchID: baselineID,
+                    orchestratorSessionID: toolCtx?.sessionID ?? "",
+                    producerSessionID: producerSid,
+                    producerTier: tier,
+                    description: args.task,
+                    cwd: effectiveCwd,
+                    dod,
+                    dispatchedAt: dispatchStart.dispatchedAt,
+                    // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+                    budget: captureBudget(producerSid, sessionStore.readCapReached(producerSid)),
+                  })
+                : undefined;
+              // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
+              // (and its ladder) below, with the dispatch record still in the store.
+              if (finish?.deferred === true) {
+                deferredOwnsBaseline = true;
+                if (producerSid !== baselineID) changedFileStore.clear(producerSid);
+                try {
+                  sessionStore.unregister(producerSid);
+                  sessionRootMemo.delete(producerSid);
+                } catch {
+                  // non-fatal
+                }
+                try {
+                  guardStore.clear(producerSid);
+                } catch {
+                  // non-fatal
+                }
+                effortOverrides.clear(producerSid);
+                await disposeChildSession(producerSid);
+                return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
+              }
+              // Once a delegation is gated, every later attempt of its ladder is gated too.
+              if (finish !== undefined && dispatchStart !== undefined) {
+                dispatchStart = { ...dispatchStart, directives: { ...dispatchStart.directives, mode: "required" } };
+              }
+
+              const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
+              // One deadline per gate invocation: every step inside the gate
+              // is bounded by it, and it is aborted (killing any spawned
+              // tree) when the gate's own withTimeout rejects. It exists
+              // before prepareVerification (T2 P0, QA-2.1-4), so the grade
+              // snapshot and the wait for a pending reference count against
+              // gateBudgetMs too.
+              const gateDeadline = createDeadline(gateBudgetMs);
+              let verification;
+              try {
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline);
+              } catch (error) {
+                gateDeadline.dispose();
+                throw error;
+              }
+              const artefact = {
+                changedFiles: verification.changedFiles,
+                changeBaseline: verification.changeBaseline,
+                finalReturnText: producerText,
+                declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+                producerSessionID: producerSid,
+                producerTier: tier,
+              };
+
+              // Grader sessions opened by THIS accept() call, and only those.
+              const gateGraderSessions = new Set<string>();
+              const completedFailures: string[] = [];
+              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions, verification, gateDeadline);
+              gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+              let gateRes;
+              try {
+                gateRes = producerError
+                  ? {
+                      accepted: false,
+                      verdict: {
+                        pass: false,
+                        method: "none" as const,
+                        reasons: [`producer failed: ${producerError}`],
+                      },
+                      dodSource: dod.source,
+                    }
+                  : await withTimeout(
+                      accept(
+                        {
+                          dod,
+                          trivial: false,
+                          mode: "modeA",
+                          ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+                        },
+                        artefact,
+                        gateDeps,
+                      ),
+                      // What preparation left of the gate budget (QA-2.1-4).
+                      gateDeadline.remaining(),
+                      "verification gate",
+                    );
+              } catch (error) {
+                // Budget exhaustion is unavailable verification, not producer
+                // failure. Abort any grader still in flight so the ceiling is a
+                // real cancellation and not just a stopped wait.
+                //
+                // Scoped to THIS gate invocation's graders. The wiring-global
+                // graderSessions set is shared by every concurrent delegation,
+                // so aborting it here would kill a healthy grader belonging to
+                // someone else's delegation — reachable with the shipped
+                // config, where a deterministic check may run a command for up
+                // to 120s against a 90s gate budget.
+                gateDeadline.abort(
+                  error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+                );
+                if (error instanceof RouterTimeoutError) {
+                  for (const gsid of gateGraderSessions) {
+                    try {
+                      await ctx.client.session.abort({ path: { id: gsid } });
+                    } catch {
+                      // best-effort: the gate result stands either way
+                    }
+                  }
+                }
+                gateRes = unverifiableGateResult(
+                  error instanceof RouterTimeoutError
+                    ? `verification gate timed out after ${gateBudgetMs}ms`
+                    : `verification unavailable: ${scrubText(String(error))}`,
+                  dod.source,
+                  activeCfg.enforcement?.verify?.strictUnverifiable,
+                  completedFailures,
+                );
+              } finally {
+                gateDeadline.dispose();
+              }
+              // pending.ts R11, as on the native path. Within this ladder every attempt is judged
+              // against the first attempt's reference and dispatchedAt precedes every landedAt, so
+              // it only affects later delegations of the same session (a native re-dispatch of
+              // rejected delegate work is the T11 case too).
+              gateRes = applyLineage(gateRes, {
+                orchestratorSessionID: toolCtx?.sessionID ?? "",
+                root: verification.snapshot?.root,
+                dispatchID: baselineID,
+                dispatchedAt: dispatchStart?.dispatchedAt ?? returnedAt,
+                returnedAt,
+                strictUnverifiable: activeCfg.enforcement?.verify?.strictUnverifiable,
+              });
+              // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
+              gateRes = applyDispatchCaveats(gateRes, verification);
+
+              // Per-attempt cleanup (drop producer session tracking + state).
+              if (producerSid !== baselineID) changedFileStore.clear(producerSid);
+              try {
+                sessionStore.unregister(producerSid);
+                sessionRootMemo.delete(producerSid);
+              } catch {
+                // non-fatal
+              }
+              try {
+                guardStore.clear(producerSid);
+              } catch {
+                // non-fatal
+              }
+              // Dispose this attempt's backend session before the next iteration
+              // so a long ladder never accumulates live sessions.
+              effortOverrides.clear(producerSid);
+              // A session-aware ladder (2.3) may resume this child on the next attempt, so its disposal is the loop's
+              // decision, taken once the ladder has said retry/escalate and whether it resumes; every exit path is
+              // still covered by the `finally` below. Without a session-aware policy: as before.
+              if (!sessionAware) await disposeChildSession(producerSid);
+
+              return { sessionID: producerSid, text: producerText, gateRes, producerFailed: producerError !== null, confirmProducer };
+            };
+
+            while (true) {
+              if (safety++ > safetyMax) {
+                return withDepthBanner(
+                  `[router status: unmet] delegation stopped by the safety net after ` +
+                  `${state.totalAttempts} attempt(s).\n\n${scrubText(producerText)}`
+                );
+              }
+              const tier = state.currentTier;
+              const attempt = await runProducerAttempt(plan, forcing);
+              if (!attempt) {
+                return withDepthBanner("[router] delegate failed: could not create a producer session.");
+              }
+              producerText = attempt.text;
+              if ("deferredFooter" in attempt) {
+                // Section 1.5-16: the result unchanged plus the footer, appended last. Never
+                // labelled accepted or verified, and never retried or escalated.
+                return appendRouterFooter(withDepthBanner(producerText), attempt.deferredFooter);
+              }
+              const producerSid = attempt.sessionID;
+              const gateRes = attempt.gateRes;
+
+              // A17: charge the rung this attempt ran (a candidate's own ratio), the tier's ratio when it has none.
+              const costRatio =
+                rungCost ??
+                (typeof tiersForCost?.[tier]?.costRatio === "number"
+                  ? tiersForCost[tier].costRatio
+                  : 1);
+              // D11: the child and its last-step context (from the registry) decide a resume. A producer that errored
+              // or timed out reports no context, so the next attempt starts fresh. The context is read only once the
+              // child's execution end has been seen (QA-2.3-2): that event follows every step event on the stream, so
+              // the number includes the final, largest step. The gate has usually run long enough for it to be there;
+              // when it is not, wait for it, at most RESUME_END_WAIT_MS and no longer than the delegation lives, and
+              // otherwise start fresh (`unknown-tokens`). Nothing is awaited when no retry can follow.
+              let lastStepTokens: number | null = null;
+              if (sessionAware && !attempt.producerFailed) {
+                // No wait when nothing can follow this attempt (QA-2.3-R2-5): accepted, unverifiable, or the ladder's
+                // own limits (checks 3 and 4 of `nextAction`) are reached after it.
+                const firstCost = state.firstAttemptCost ?? costRatio;
+                const limitReached =
+                  state.totalAttempts + 1 >= policy.maxTotalAttempts ||
+                  (policy.costMultiple != null && state.cumulativeCost + costRatio > firstCost * policy.costMultiple);
+                if (!gateRes.accepted && gateRes.verdict.outcome !== "unverifiable" && !limitReached) {
+                  await awaitExecutionEnd(producerSid, RESUME_END_WAIT_MS, toolCtx?.abort);
+                }
+                lastStepTokens = lastStepContext(producerSid);
+              }
+              state = recordAttempt(
+                state,
+                costRatio,
+                sessionAware ? { sessionID: producerSid, lastStepTokens } : undefined,
+              );
+              // The verdict of this attempt, on the attempt's own registration (variant steps feed the store separately).
+              if (recording && !gateRes.verdict.skipped) {
+                // R2-2: a failed/timed-out producer may never deliver host confirmation. The ladder's
+                // verdict still needs its decision row; the same callback is idempotent after host progress/result.
+                attempt.confirmProducer?.();
+                // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+                ingest?.onVerdict(producerSid, verdictOf(gateRes.verdict), verdictGraderOf(gateRes.verdict));
+              }
+
+              const action = nextAction(
+                state,
+                {
+                  pass: gateRes.accepted, outcome: gateRes.verdict.outcome, reasons: gateRes.verdict.reasons,
+                  // Handoff 25, R7 (I1/I8 exemption: §2.9 E8, the I7 budget-incomplete rule): the structured incomplete flag; absent
+                  // when false, so the action is unchanged.
+                  ...(isIncompleteVerdict(gateRes.verdict) ? { incomplete: true } : {}),
+                },
+                policy,
+                sessionAware ? { dispatchPromptChars: args.task.length } : undefined,
+              );
+
+              if (action.action === "accept") {
+                dumpDelegateScorecard(
+                  producerSid,
+                  state,
+                  true,
+                  gateRes.verdict.method,
+                );
+                return withDepthBanner(producerText) + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.outcome, gateRes.verdict.caveats, gateRes.verdict.notes);
+              }
+              if (action.action === "give_up") {
+                dumpDelegateScorecard(
+                  producerSid,
+                  state,
+                  false,
+                  gateRes.verdict.method,
+                );
+                // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): no flag when false, so the note is unchanged.
+                const note = scrubText(buildForcingNote(gateRes.verdict.reasons, isIncompleteVerdict(gateRes.verdict) ? { incomplete: true } : undefined));
+                return withDepthBanner(
+                  `[router status: unmet] The delegated result was not accepted after ` +
+                  `${state.totalAttempts} attempt(s) across ${state.escalations} escalation(s) ` +
+                  `(final tier ${state.currentTier}; ${action.reason ?? "verification failed"}).\n\n` +
+                  `${scrubText(producerText)}\n\n${note}`
+                );
+              }
+              // retry or escalate
+              forcing = action.forcingMessage ?? null;
+              state = advance(state, action);
+              plan = planNextAttempt({ action, state, previous: plan, cfg: activeCfg, policy, catalog });
+              // The rung the plan actually dispatches (QA-2.3-8: not the action's when the plan fell back to the tier's model).
+              rungCost = plan.costRatio;
+              // The child this attempt ran on is kept only when the next attempt resumes it (D11); otherwise it is
+              // discarded now, so a long ladder never accumulates live sessions.
+              if (sessionAware && plan.resumeSessionID !== producerSid) await disposeChildSession(producerSid);
+            }
+          } catch {
+            return withDepthBanner("[router] delegate failed (fail-closed): the delegation or verification could not complete.");
+          } finally {
+            // Safety net for every exit path an end-of-iteration dispose cannot
+            // reach: accept/give-up returns, the safety-net return, and throws.
+            // disposeChildSession is fail-soft, so re-disposing an already
+            // disposed session is harmless.
+            for (const sid of producerSessions) {
+              if (!(deferredOwnsBaseline && sid === baselineID)) changedFileStore.clear(sid);
+              effortOverrides.clear(sid);
+              await disposeChildSession(sid);
+            }
+          }
+        },
+      }) } : {}),
+      // 2.4.3b, section 1.5-18: verify deferred delegations on the orchestrator's terms.
+      ...(routerVerifyEnabled ? { router_verify: tool({
+        description:
+          "Verify delegations that returned 'unverified' with a vrf_ handle. Runs the same checks as a required verification (affected tests, batched, under the verification slot and one gate deadline) and returns one verdict per handle: pass, fail (with the introduced failures and a suggested next tier) or unverifiable. Nothing is retried or escalated for you. Pass exactly one of `handles` or `pending: true` (every unverified delegation of this session).",
+        args: {
+          handles: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("The vrf_ handles from the delegations' [router] footers."),
+          pending: tool.schema
+            .boolean()
+            .optional()
+            .describe("true: verify every still-unverified delegation of this session."),
+        },
+        async execute(
+          args: { handles?: string[]; pending?: boolean },
+          toolCtx?: { sessionID?: string; abort?: AbortSignal },
+        ): Promise<string> {
+          // Never throws: every failure is a text answer (the tool result reaches the orchestrator).
+          try {
+            const target = parseRouterVerifyArgs(args);
+            if ("error" in target) return target.error;
+            // R6: handles are scoped by the calling session; without one, every handle is unknown.
+            const sessionID = typeof toolCtx?.sessionID === "string" ? toolCtx.sessionID : "";
+            const report = await verifyHandles(sessionID, target, toolCtx?.abort !== undefined ? { signal: toolCtx.abort } : {});
+            return report.text;
+          } catch (error) {
+            logger.warn("[verify] router_verify failed", { error: scrubText(String(error)) });
+            return `[router] router_verify failed; nothing was verified: ${scrubText(String(error))}`;
+          }
+        },
+      }) } : {}),
+    },
+
+    // -----------------------------------------------------------------------
+    // Detect subagent calls via chat.message. When the agent name matches a
+    // registered tier, record the sessionID so system.transform can skip
+    // delegation-protocol injection.
+    //
+    // IMPORTANT: must be chat.message, NOT chat.params. The opencode hook
+    // order is chat.message -> system.transform -> chat.params, so populating
+    // the Set in chat.params is always one step too late — system.transform
+    // already ran with an empty Set and leaked the "Delegate with Task(...)"
+    // instructions into the subagent's system prompt. Sonnet subagents like
+    // @explore silently ignore that noise, but literal-minded Haiku (@fast)
+    // emits malformed XML tool calls for the nonexistent Task tool, which
+    // surface in the UI as "<parameter>...</parameter>" leakage.
+    //
+    // chat.message fires inside SessionPrompt.createUserMessage() BEFORE the
+    // loop -> LLM.stream path, so by the time system.transform runs the Set
+    // is fully populated and await-safe (yield* on the plugin trigger).
+    // -----------------------------------------------------------------------
+    "chat.params": async (input: any, output: any) => {
+      try {
+        if (input?.sessionID && graderSessions.has(input.sessionID)) {
+          const graderTemperature = cfg.enforcement?.verify?.graderTemperature;
+          if (graderTemperature === null) {
+            delete output.temperature;
+          } else if (graderTemperature !== undefined && input?.model?.capabilities?.temperature !== false) {
+            output.temperature = graderTemperature;
+          }
+        }
+      } catch (error) {
+        if (!warnedGraderParams) {
+          warnedGraderParams = true;
+          try {
+            logger.warn("[verify] grader temperature not applied", { error: describeError(error) });
+          } catch {
+            // Even a failed diagnostic sink must not interrupt chat.params.
+          }
+        }
+      }
+      try {
+        if (input && typeof input === "object") {
+          applyEffortOverride(effortOverrides, input, ctx.routerHost === "v2" ? output : output?.options, routerWarn);
+        }
+      } catch (error) {
+        try {
+          logger.warn("[router] effort override not applied", { error: describeError(error) });
+        } catch {
+          // Host accessors and diagnostic sinks are both best-effort here.
+        }
+      }
+    },
+
+    "chat.message": async (input: any, output: any) => {
+      // Recorded even while bypassed: the grep redaction in `tool.execute.after` runs regardless of bypass (QA-81-R2-2).
+      if (typeof input?.sessionID === "string" && typeof input?.agent === "string" && Object.hasOwn(cfg.agents ?? {}, input.agent)) {
+        rememberPluginAgentSession(input.sessionID, input.agent);
+      }
+      if (bypassed) return;
+      // 2.4.3 (QA-2.4-R2-1): the cost doctor's notice is NEVER part of the user's message (the prompt text stays byte for byte what the user
+      // typed). It is a synthetic transcript entry, through the same host call the adapter uses for the config-reload and narration notices
+      // (`ctx.session.synthetic({ …, resume: false })`, exposed as `routerSynthetic`): it enters the context of the orchestrator's next
+      // request without resuming or answering anything. Delivery is not awaited (the host may be admitting this very prompt); a failure is
+      // logged. A host without `routerSynthetic` (OpenCode v1 has no such call and no advisor either) gets a log line instead. Only a PROVEN
+      // root session takes it (never a subagent or a grader), and only when one may be waiting.
+      if (advisorNotifier !== undefined && advisorNotifier.maybePending() && typeof input?.sessionID === "string") {
+        const noticeSession: string = input.sessionID;
+        try {
+          if (!graderSessions.has(noticeSession) && !sessionStore.isSubagent(noticeSession) && (await lookupRootSession(noticeSession)) === true) {
+            const notice = await advisorNotifier.take();
+            if (notice !== null) deliverAdvisorNotice(noticeSession, notice);
+          }
+        } catch (error) {
+          logger.warn("[router] cost doctor: notice not delivered", { error: describeError(error) });
+        }
+      }      // Re-read cfg so /preset switches take effect without restart
+      try {
+        cfg = loadConfig(projectDir);
+        warnConfigIssues(cfg, logger);
+      } catch {}
+      try {
+        sweepIdleStores();
+      } catch {
+        // best-effort maintenance: never break a real turn
+      }
+      const tierNames = Object.keys(getActiveTiers(cfg));
+      const sid = input?.sessionID;
+      // v1 `tool.execute.after` carries no agent: plugin-agent sessions are recorded at the top of this hook (QA-81-2).
+      try {
+        const registration = sessionStore.registerFromChatMessage(
+          input,
+          output,
+          cfg,
+          tierNames,
+        );
+        // A same-session same-tier re-registration is a resumed dispatch
+        // (how an opencode task_id resume reaches this hook): start a new
+        // per-dispatch guard round and count it in telemetry.
+        if (registration.resumed === true && typeof sid === "string") {
+          guardStore.beginDispatch(sid);
+          trajectoryStore.recordResume(sid, input?.agent ?? null);
+        }
+        // KNOWN RESIDUAL: a fresh registration over an EXISTING session (same
+        // sessionID, different tier) resets session cap state but leaves guard
+        // state alone, so the guard keeps counting from the old dispatch. The
+        // desync can only make the guard stricter, never laxer, and opencode
+        // assigns one agent per subagent session — so this is documented in
+        // docs/CONFIG_REFERENCE.md rather than fixed by clearing guard state,
+        // which would also drop deliverable and fingerprint history.
+      } catch {
+        // best-effort: never crash a real session during registration
+      }
+
+      // Record-only: initialise a trajectory scorecard for tracked subagents.
+      if (sid && sessionStore.isSubagent(sid)) {
+        trajectoryStore.ensure(sid, input?.agent ?? null);
+      }
+
+      // Once per lifetime, warn in the plugin log when the active preset points
+      // at models opencode's catalog says are missing or deprecated, or when a
+      // strong-model pattern matches nothing the configured providers serve.
+      // This is the whole point of the catalog: both failures are otherwise
+      // silent on every subagent dispatch. Orchestrator sessions only, never
+      // throws, and deferred (see startCatalogFetch): turn 1 starts the fetch,
+      // a later turn reports what it found.
+      if (sid && !sessionStore.isSubagent(sid)) {
+        try {
+          if (!catalogFetchStarted) {
+            // Turn 1: kick the fetch off and move on. NO await here.
+            startCatalogFetch();
+          } else if (!catalogWarned && deferredCatalog !== undefined) {
+            // A later turn found the turn-1 fetch already settled: report now.
+            catalogWarned = true;
+            const catalog = deferredCatalog;
+            if (catalog) {
+              // User-authored strong-model patterns matching nothing any
+              // configured provider serves. Shipped defaults are never reported
+              // (see findOrphanedStrongPatterns), so reaching here means the
+              // user wrote a claim about this environment that is false.
+              // Catalog-dependent, so it rides the same deferred path — it is
+              // NOT emitted on turn 1.
+              for (const p of findOrphanedStrongPatterns(cfg, catalog)) {
+                logger.warn(
+                  `strong-model pattern '${p}' from your modelGenerations.strong matches no model your providers serve, so it decides nothing — separator style is already ignored when matching`,
+                  { pattern: p },
+                );
+              }
+              for (const it of validateModels(cfg, catalog)) {
+                const hint =
+                  it.suggestions.length > 0
+                    ? ` — try ${it.suggestions.join(", ")}`
+                    : "";
+                // Fallback issues are keyed by the chain's provider, not a tier.
+                const where =
+                  it.scope === "fallback"
+                    ? `${it.tier}[${it.providerId}]`
+                    : `@${it.tier}`;
+                logger.warn(`${where} ${it.ref}: ${it.kind}${hint}`, {
+                  tier: it.tier,
+                  ref: it.ref,
+                  kind: it.kind,
+                  suggestions: it.suggestions,
+                });
+              }
+            }
+          }
+        } catch {
+          // best-effort: never disrupt a real session
+        }
+      }
+    },
+
+    // -----------------------------------------------------------------------
+    // Hard-block enforcement (Layer 1). Fires before tool execution; only
+    // engaged for subagent sessions when enforcement mode is advisory/enforced.
+    // Throws to abort the tool call when a guard fires; never throws for
+    // non-subagent sessions or when enforcement is off (GA-1 preserved).
+    // -----------------------------------------------------------------------
+    "tool.execute.before": async (input: any, output: any) => {
+      // #84 P2.1: a role child's own call names its role agent (the v2 adapter passes the calling agent). Remembered even while
+      // bypassed (the work-root resolver and the authority tool are authority, not routing), and marked a child session: role
+      // agents are subagents, so the guard engages from their first call. Never on v1 / in tiers mode (no role table).
+      if (rememberRoleSession(input?.sessionID, input?.agent)) {
+        sessionStore.markChildSession(input.sessionID);
+        applyPendingRoleCap(input.sessionID); // QA-P21-2-3
+      }
+      if (bypassed) {
+        noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
+        return;
+      }
+      if (input?.tool === "task") {
+        const depth = await depthGuard.checkDispatch(input.sessionID);
+        if (depth.block) {
+          try {
+            if (typeof input.sessionID === "string") {
+              trajectoryStore.recordToolEvent(input.sessionID, {
+                tool: input.tool, readOnly: READ_ONLY_TOOLS.has(input.tool), blocked: true,
+              });
+            }
+          } catch (error) {
+            logger.warn("[router] delegation depth: refusal not recorded", { error: describeError(error) });
+          }
+          throw new Error(depth.message);
+        }
+        if (depth.banner) stashDepthBanner(input, output, depth.banner);
+      }
+      // Observe before execution too: an in-flight edit must contaminate a
+      // capture even if the test finishes before the edit's after-hook fires.
+      if (typeof input?.tool === "string") changedFileStore.observeEdit(input.tool,
+        typeof output?.args?.cwd === "string" ? output.args.cwd : undefined);
+      if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string") {
+        const mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+        if (shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) {
+          if (output && typeof output === "object") output[TASK_VERIFICATION] = true;
+          const prompt = typeof output?.args?.prompt === "string" ? output.args.prompt : undefined;
+          const description = typeof output?.args?.description === "string" ? output.args.description : undefined;
+          const dod = buildDelegationDoD({ prompt, description });
+          // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
+          // dispatch header or any repair touches it, and are kept for the after hook. The capture
+          // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
+          // DF2-F1: a role dispatch's capture is taken in its verification root (never in a refused cwd).
+          await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
+            verificationScopeOf(input.callID, output?.args, dod).cwd,
+            dod,
+            dispatchDirectiveText(prompt, description),
+            true);
+        }
+      }
+      // A task call with no prompt (typically a forced delegation of a bare
+      // greeting) is otherwise rejected by the harness with a terse schema
+      // error. Repair it from the description, or refuse it readably. The
+      // refusal is computed inside the best-effort try and thrown outside it,
+      // so the catch can never swallow it.
+      let promptRefusal: string | null = null;
+      try {
+        if (input?.tool === "task" && cfg.taskPromptRepair !== false) {
+          const rawArgs: unknown = output?.args;
+          if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+            const args = rawArgs as Record<string, unknown>;
+            // Only an absent or blank prompt is repaired; a non-string prompt of
+            // some other type is a different malformation left to the harness.
+            const rawPrompt = args.prompt;
+            if (rawPrompt === undefined || rawPrompt === null || (typeof rawPrompt === "string" && rawPrompt.trim() === "")) {
+              const description = typeof args.description === "string" ? args.description.trim() : "";
+              if (description) {
+                args.prompt = description;
+              } else {
+                promptRefusal = "[router] This task call carried no prompt, and the task tool needs a non-empty `prompt` " +
+                  "stating the work for the delegate. Re-issue the call with the work restated as an instruction in " +
+                  "`prompt`. If the request carries no task at all (a greeting, an acknowledgement), do not delegate: " +
+                  "answer it directly instead.";
+              }
+            }
+          }
+        }
+      } catch {
+        // Best-effort: malformed or frozen args must never break a dispatch.
+      }
+      if (promptRefusal) throw new Error(promptRefusal);
+      // Dispatch hygiene is independent of subagent guard enforcement below.
+      // The plugin API declares generic args, not a task-specific argument shape.
+      try {
+        if (input?.tool === "task" && cfg.dispatchHeader !== false) {
+          const rawArgs: unknown = output?.args;
+          if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+            const args = rawArgs as Record<string, unknown>;
+            const tier = typeof args.subagent_type === "string"
+              ? args.subagent_type : args.subagentType;
+            if (
+              typeof tier === "string" &&
+              Object.prototype.hasOwnProperty.call(getActiveTiers(cfg), tier) &&
+              typeof args.prompt === "string" &&
+              !args.prompt.startsWith(DISPATCH_HEADER_PREFIX)
+            ) {
+              // Resolve from the original dispatch, using the registration rules.
+              const parsed = parseCapDirective(args.prompt);
+              const override =
+                parsed === "none" && !/\breason:/i.test(args.prompt) ? null : parsed;
+              const baseline = cfg.tierCaps?.[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5;
+              const cap = override ?? baseline;
+              // Handoff 30, R7 (I1/I8 exemption: T1.5.3a, the header names `root=`): on v2 shadow/advise/enforce the engine stripped the
+              // route line already; its `root=` comes from the router. No root → the header is byte-identical to before.
+              const root = routeLineRoot(args.prompt) ?? (typeof input.callID === "string" ? strippedRouteRoot(input.callID) : undefined);
+              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root }) +
+                DISPATCH_HEADER_SEPARATOR + args.prompt;
+              args.prompt = prompt;
+              if (process.env.MODEL_ROUTER_DISPATCH_DEBUG === "1" && !dispatchDebugLogged) {
+                dispatchDebugLogged = true;
+                const dir = join(tmpdir(), "opencode-model-router-trajectory");
+                mkdirSync(dir, { recursive: true });
+                writeFileSync(join(dir, "dispatch.log"), JSON.stringify({
+                  headerApplied: true, tier, promptLength: prompt.length,
+                }) + "\n", { flag: "a" });
+              }
+            }
+          }
+        }
+      } catch {
+        // Best-effort: malformed args or debug I/O must never break a dispatch.
+      }
+      // #84 P2.1: a routed role dispatch of this session (roles mode on v2 only): resume round, re-dispatch signal.
+      if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string"
+        && output?.args && typeof output.args === "object") {
+        try {
+          noteRoleDispatch(input.callID, input.sessionID, output.args as Record<string, unknown>);
+        } catch (error) {
+          logger.warn("[router] roles: the role dispatch could not be noted", { error: describeError(error) });
+        }
+      }
+      const sid = input?.sessionID;
+      if (!sid || !sessionStore.isSubagent(sid) || typeof input?.tool !== "string") {
+        return;
+      }
+      // Start-of-call refresh: the idle TTL must cover the tool's runtime, not
+      // just the moment it finished.
+      sessionStore.touchIfTracked(sid);
+      let res;
+      try {
+        // Handoff 27: a role child is guarded with its role profile (reader/producer, role budget); tier agents get none.
+        const profile = roleGuardProfileOf(sid, input?.agent);
+        res = guardBeforeCall({
+          cfg,
+          tier: sessionStore.getTier(sid),
+          trivial: sessionStore.isTrivial(sid),
+          cap: sessionStore.getCap(sid),
+          sessionID: sid,
+          tool: input.tool,
+          toolArgs: output?.args,
+          store: guardStore,
+          env: process.env,
+          ...(profile === undefined ? {} : { profile }),
+        });
+      } catch {
+        return; // never break a real session on a guard-internal error
+      }
+      if (res.block) {
+        trajectoryStore.recordToolEvent(sid, {
+          tool: input.tool,
+          readOnly: READ_ONLY_TOOLS.has(input.tool),
+          blocked: true,
+          selfScript: res.guard === "anti_self_script",
+        });
+        throw new Error(res.message);
+      }
+    },
+
+    // -----------------------------------------------------------------------
+    // Runtime cap + redundancy enforcement (subagents only).
+    // Appends `[cap: N/MAX]` and `[⚠ REDUNDANT]` / `[⚠ CAP REACHED]` banners
+    // to every read-only tool result the subagent sees. Because these land
+    // inside `output.output` — the tool's own response text — the model
+    // treats them as ground truth rather than advisory system noise.
+    // -----------------------------------------------------------------------
+    "tool.execute.after": async (input: any, output: any) => {
+      if (input?.tool === "grep" && typeof output.output === "string") {
+        const tier = input.agent ?? pluginAgentSessions.get(input.sessionID) ?? sessionStore.getTier(input.sessionID);
+        const definition = tier && getActiveTiers(cfg)[tier];
+        // Every plugin agent is redacted (a denied grep produces no output anyway), readOnly or explicit-permission.
+        const isPlugin = typeof tier === "string" && Object.hasOwn(cfg.agents ?? {}, tier);
+        if ((definition && isReadOnlyTier(tier, definition)) || isPlugin) output.output = filterSensitiveGrep(output.output);
+      }
+      if (bypassed) {
+        noteBypassedRoleCall(input?.sessionID); // QA-P21-1-7
+        return;
+      }
+      sessionStore.recordToolCall(input, output);
+
+      // #84 P2.1 (handoffs 13, 15-17, 23): role children only (roles mode on v2). Edit times feed the `run` signal; the parent's
+      // `task` return feeds the return/run signals, read BEFORE any router note is put in front of the child's text.
+      try {
+        if (typeof input?.sessionID === "string" && ROLE_EDIT_TOOLS.has(input?.tool) && roleOfSession(input.sessionID) !== undefined) {
+          pushBounded(roleEdits, input.sessionID, Date.now());
+        }
+        if (input?.tool === "task" && typeof input.callID === "string" && rolesNow().size > 0) {
+          observeRoleReturn(input.callID, input?.args && typeof input.args === "object" ? input.args : {}, output);
+        }
+      } catch (error) {
+        logger.warn("[router] roles: the role return could not be observed", { error: describeError(error) });
+      }
+
+      // Best-effort false-refusal observation alongside the existing guard path.
+      // Keep scorecards unchanged; counts live in the TTL-managed trajectory.
+      try {
+        if (input?.tool === "task" && cfg.falseRefusalDetection !== false) {
+          const { childSessionID, text } = parseRefusalTaskResult(output);
+          if (childSessionID) {
+            const calls = trajectoryStore.toolCallCount(childSessionID);
+            if (detectFalseRefusal({ toolCalls: calls, resultText: text }).suspected) {
+              output.output = `[router] FALSE-REFUSAL SUSPECT — this delegate returned a hand-back after 0 tool calls. No tool call was observed for this child, so the capability claim in its answer is untested rather than demonstrated. Re-dispatch the same work with task_id="${childSessionID}" and an instruction to attempt it, or do it yourself; do not escalate a tier on this result.\n\n${output.output}`;
+              trajectoryStore.recordFalseRefusal(childSessionID);
+              ingest?.onFalseRefusal(childSessionID);
+            }
+          }
+        }
+      } catch {
+        // Best-effort: malformed/frozen results must never break a dispatch.
+      }
+
+      // Record-only trajectory observation (mutates internal maps only; never
+      // touches output, so emitted banners/observations stay byte-identical).
+      const sid = input?.sessionID;
+
+      // Attribute changed files to whichever session made the edit (any session).
+      if (sid && typeof input?.tool === "string") {
+        changedFileStore.record(sid, input.tool, input?.args);
+      }
+
+      let unbannered: { output: unknown } | undefined;
+      if (input?.tool === "task") {
+        const key = `${sid}:${input.callID}`;
+        const banner = depthBanners.get(key);
+        depthBanners.delete(key);
+        if (banner !== undefined) {
+          try {
+            unbannered = { output: output.output };
+            const text = typeof output.output === "string" ? output.output.trimEnd() : "";
+            output.output = text ? `${text}\n\n${banner}` : banner;
+          } catch (error) {
+            logger.warn("[router] delegation depth: advisory banner not delivered", { error: describeError(error) });
+          }
+        }
+      }
+
+      if (sid && sessionStore.isSubagent(sid) && typeof input?.tool === "string") {
+        trajectoryStore.recordToolEvent(sid, {
+          tool: input.tool,
+          readOnly: READ_ONLY_TOOLS.has(input.tool),
+        });
+        try {
+          const profile = roleGuardProfileOf(sid, input?.agent); // handoff 27, as in the before-hook
+          guardAfterCall({
+            cfg,
+            tier: sessionStore.getTier(sid),
+            sessionID: sid,
+            tool: input.tool,
+            toolArgs: input?.args,
+            output,
+            store: guardStore,
+            ...(profile === undefined ? {} : { profile }),
+          });
+        } catch {
+          // best-effort: enforcement must never crash a real session
+        }
+      }
+
+      // Option (i): verify-dispatch around the built-in `task` tool (advisory-grade —
+      // we observe the finished task result and append a forcing note if it is not
+      // accepted; we cannot retry a task call that already finished).
+      if (typeof input?.tool === "string") {
+        let mode = "off";
+        try {
+          mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+        } catch {
+          // fall through with mode "off"
+        }
+        const requireMode = cfg.enforcement?.verify?.require;
+        if (shouldVerifyTask(input.tool, mode, requireMode)) {
+          try {
+            // pending.ts R11: the producer's changes landed by now.
+            const returnedAt = Date.now();
+            const { finalReturnText, childSessionID } = parseTaskResult(unbannered ? { ...output, output: unbannered.output } : output);
+            const producerTier =
+              typeof input?.args?.subagent_type === "string"
+                ? input.args.subagent_type
+                : "";
+            const dod = buildDelegationDoD({
+              prompt: input?.args?.prompt,
+              description: input?.args?.description,
+            });
+            // DF2-F1: a role dispatch is verified in its verification root (capture, change set, checks, deferral); a requested
+            // cwd outside that root is refused by the gate below, never deferred to run there later.
+            const scope = verificationScopeOf(input.callID, input?.args, dod);
+            const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
+            const effectiveCwd = scope.cwd;
+            const dispatchID = `task:${input.sessionID}:${input.callID}`;
+            // #84 QA-G-B-2-1: a routed role dispatch keeps its child's verification lineage; a resume that CARRIES the acceptance of an
+            // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
+            const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
+            const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
+            const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
+            const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
+            const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
+            // 2.4.2b: the mode the orchestrator chose at dispatch (never the subagent's text).
+            const start = takeDispatch(dispatchID, dispatchDirectiveText(taskPrompt, taskDescription));
+            const trivial = childSessionID
+              ? sessionStore.isTrivial(childSessionID)
+              : false;
+            // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
+            // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
+            if (!scope.outside && !carriedRole && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+              // Section 1.5-16: no gate, no test process; the result goes back now with the
+              // footer, which is appended last and never says accepted or verified.
+              const finish = await finishDeferred(changedFileStore, {
+                dispatchID,
+                orchestratorSessionID,
+                producerSessionID: childSessionID ?? "",
+                producerTier,
+                description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
+                cwd: effectiveCwd,
+                // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
+                ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
+                dod,
+                dispatchedAt: start.dispatchedAt,
+                // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
+                budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
+              });
+              if (finish.deferred) {
+                output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
+                // The dispatch record is cleared by finishDeferred once its capture settled.
+                if (childSessionID) changedFileStore.clear(childSessionID);
+                return;
+              }
+              // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
+            }
+            // Same bound as the delegate gate: one deadline per invocation,
+            // a withTimeout ceiling, and abort-on-reject so a hung check or
+            // grader cannot hold the after-hook (and its process tree) open.
+            // The deadline exists before prepareVerification (T2 P0,
+            // QA-2.1-4), so preparation counts against gateBudgetMs.
+            const { gateBudgetMs } = resolveVerifyBudget(cfg);
+            const gateDeadline = createDeadline(gateBudgetMs);
+            let verification;
+            try {
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", effectiveCwd, gateDeadline);
+            } catch (error) {
+              gateDeadline.dispose();
+              throw error;
+            }
+            // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
+            // changed since the attempt that introduced the carried block, against that attempt's reference.
+            if (routedRole !== undefined && childSessionID) verification = roleAttemptVerification(childSessionID, verification, { carried: carriedRole });
+            // #84 P2.1: a role agent follows the return contract (handoff 26; roles mode only).
+            const roleProducer = roleSpecOf(producerTier) !== undefined;
+            const artefact = {
+              changedFiles: verification.changedFiles,
+              changeBaseline: verification.changeBaseline,
+              finalReturnText,
+              declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+              producerSessionID: childSessionID ?? "",
+              producerTier,
+              ...(roleProducer ? { returnContract: true } : {}),
+              // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule; every mode): the guard's budget state when the task
+              // returned, not when the gate runs. Without a stop it judges like the live read it replaces.
+              budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
+            };
+
+            // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
+            // native Task() that changed no files is exploration, not implementation.
+            // There is nothing concrete to verify, so skip rather than grade the
+            // findings against the task's own summary, which otherwise appends false
+            // "not accepted" notes to legitimate read-only research delegations.
+            // Explicit [acceptance] blocks (source != "inferred") and inferred
+            // deterministic checks (dod.kind === "deterministic") still verify normally.
+            if (
+              dod.source === "inferred" &&
+              dod.kind === "checker" &&
+              artefact.changedFiles.length === 0
+            ) {
+              gateDeadline.dispose();
+              if (childSessionID) changedFileStore.clear(childSessionID);
+              changedFileStore.clear(dispatchID);
+              return;
+            }
+
+            const gateGraderSessions = new Set<string>();
+            const completedFailures: string[] = [];
+            // Keep the native grader unparented on the backend; only depth tracking uses its caller.
+            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
+            gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+            // #84 QA-G-B-2-1: a carried acceptance never passes on a testsPass/lintClean that ran no process.
+            if (carriedRole) gateDeps.deterministic.noAffectedUnverifiable = CARRIED_NO_PROCESS_REASON;
+            let res;
+            try {
+              res = await withTimeout(
+                accept(
+                  {
+                    dod,
+                    trivial,
+                    mode: "modeA",
+                    // Native task has no cwd argument; the acceptance block can supply it.
+                    ...(scope.requested ? { cwd: scope.requested } : {}),
+                    ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
+                    ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
+                    // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
+                    ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
+                  },
+                  artefact,
+                  gateDeps,
+                ),
+                // What preparation left of the gate budget (QA-2.1-4).
+                gateDeadline.remaining(),
+                "verification gate",
+              );
+            } catch (error) {
+              gateDeadline.abort(
+                error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+              );
+              if (error instanceof RouterTimeoutError) {
+                for (const gsid of gateGraderSessions) {
+                  try {
+                    await ctx.client.session.abort({ path: { id: gsid } });
+                  } catch {
+                    // best-effort: the gate result stands either way
+                  }
+                }
+              }
+              res = unverifiableGateResult(
+                error instanceof RouterTimeoutError
+                  ? `verification gate timed out after ${gateBudgetMs}ms`
+                  : `verification unavailable: ${scrubText(String(error))}`,
+                dod.source,
+                cfg.enforcement?.verify?.strictUnverifiable,
+                completedFailures,
+              );
+            } finally {
+              gateDeadline.dispose();
+            }
+            // pending.ts R11: a proven-introduced rejection is recorded for this session; a pass
+            // on ids an earlier rejection introduced becomes unverifiable (never a new pass/fail).
+            res = applyLineage(res, {
+              orchestratorSessionID,
+              root: verification.snapshot?.root,
+              dispatchID,
+              dispatchedAt: start.dispatchedAt,
+              returnedAt,
+              strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
+            });
+            // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
+            res = applyDispatchCaveats(res, verification);
+            // M6 (2.1.3): a real verdict of a registered child dispatch feeds the outcome store (v2, engine != static).
+            // #84 P3.3 fix 2 (plan §2.6, I6): a grader's verdict is a grader signal of a role dispatch, never a deterministic one.
+            if (childSessionID && !res.verdict.skipped) ingest?.onVerdict(childSessionID, verdictOf(res.verdict), verdictGraderOf(res.verdict));
+            if (!res.accepted && !res.verdict.skipped) {
+              const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
+              const li = ladder.indexOf(producerTier);
+              const nextTier = res.verdict.outcome !== "unverifiable" && li >= 0 && li < ladder.length - 1 ? ladder[li + 1] : null;
+              // Handoff 25, R7 (I1/I8 exemption: the I7 budget-incomplete rule): absent when false, so the note is unchanged.
+              const incomplete = isIncompleteVerdict(res.verdict);
+              let note = scrubText(buildForcingNote(res.verdict.reasons, { producerTier, nextTier, ...(incomplete ? { incomplete: true } : {}) }));
+              // P-8 (handoff 39): a role agent is resumed on a higher tier of its range, never re-run on a tier agent.
+              // QA-P21-1-4: only after a FAIL (an unverifiable result keeps the generic line: there is nothing to escalate on).
+              // QA-P21-2-2: the hint promises the raise, and records it for this parent's next resume of the child.
+              const roleHint = roleProducer && !incomplete && res.verdict.outcome === "fail" && childSessionID
+                ? roleEscalationAfterFail(cfg, childSessionID, orchestratorSessionID) : null;
+              const genericNext = "NEXT: address the above and re-run the delegation; do not treat the prior result as complete.";
+              if (roleHint !== null && note.endsWith(genericNext)) note = note.slice(0, note.length - genericNext.length) + scrubText(roleHint);
+              output.output =
+                typeof output.output === "string"
+                  ? output.output + "\n\n" + note
+                  : note;
+            }
+            // QA-3.1-18: a clean pass also gets a line (`[router ✓ verified: …]`); a skipped
+            // check stays silent unless it carries caveats or notes.
+            if (res.accepted && (!res.verdict.skipped || res.verdict.caveats?.length || res.verdict.notes?.length)) {
+              output.output += buildAcceptedSuffix(res.verdict.method, res.verdict.outcome, res.verdict.caveats, res.verdict.notes);
+            }
+            if (childSessionID) changedFileStore.clear(childSessionID);
+            changedFileStore.clear(dispatchID);
+          } catch {
+            // fail-closed: a verification error must NEVER throw out of the after-hook
+          }
+        }
+      }
+    },
+
+    // -----------------------------------------------------------------------
+    // Narration detector — flags progress-commentary-without-production.
+    //
+    // Fires per completed text part. Scans for narration patterns; if any
+    // match, logs a warning to the plugin console and appends a visible
+    // banner to the text so the user sees the detection in the UI. This is
+    // telemetry, not blocking — we cannot modify mid-stream generation, only
+    // post-hoc signal.
+    // -----------------------------------------------------------------------
+    "experimental.text.complete": async (input: any, output: any) => {
+      if (bypassed || !cfg.antiNarration) return;
+      const text = output?.text;
+      if (typeof text !== "string" || text.length < 20) return;
+
+      const found = detectNarration(text);
+      if (found.length === 0) return;
+
+      const quoted = found
+        .map((m) => `"${m.slice(0, 60)}${m.length > 60 ? "…" : ""}"`)
+        .join(", ");
+      output.text = `${text}\n\n[⚠ narration detected: ${quoted}]`;
+    },
+
+    // -----------------------------------------------------------------------
+    // Session lifecycle: classify children on session.created, then write
+    // enforcement scorecards on session.idle. Full trajectory debug dumps
+    // remain opt-in behind MODEL_ROUTER_TRAJECTORY_DEBUG=1 (Phase 0.3, T0.3.3).
+    // Dumps go under the OS temp dir for manual inspection. Best-effort;
+    // never throws into the session or emits model-visible debug output.
+    // -----------------------------------------------------------------------
+    event: async ({ event }: any) => {
+      if (event?.type === "session.deleted") {
+        try {
+          const id = event?.properties?.info?.id;
+          if (typeof id === "string") {
+            sessionRootMemo.delete(id);
+            sessionLookupFailedAt.delete(id);
+            pluginAgentSessions.delete(id);
+            sessionStore.unregister(id);
+            effortOverrides.clear(id);
+            depthTracker.forget(id);
+            for (const key of depthBanners.keys()) {
+              if (key.startsWith(`${id}:`)) depthBanners.delete(key);
+            }
+            warnedNoCallID.delete(id);
+            forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
+            // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
+            // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
+            background?.forgetSession(id);
+            pending.forgetSession(id);
+          }
+        } catch {
+          // best-effort: cleanup must never crash a real session
+        }
+        return;
+      }
+      // Child-session classification. opencode reports every child session with
+      // a parentID, which is the only agent-name-INDEPENDENT signal available:
+      // registerFromChatMessage recognises a session only when its agent name is
+      // literally an active tier, so `general`, `explore`, markdown agents,
+      // every agent mapped through `subagentTiers` (which by construction can
+      // never be tier-named — see resolveSubagentOverrides) and the plugin's own
+      // grader sessions all went unmarked. Unmarked meant system.transform
+      // injected "You are the orchestrator, delegate with Task(...)" into a
+      // subagent that has no task tool, and the subagent refused the work.
+      if (event?.type === "session.created") {
+        const info = event?.properties?.info;
+        try {
+          if (typeof info?.id === "string") {
+            depthTracker.recordCreated(info.id,
+              typeof info.parentID === "string" && info.parentID !== "" ? info.parentID : null);
+          }
+        } catch (error) {
+          logger.warn("[router] delegation depth: session creation not recorded", { error: describeError(error) });
+        }
+        if (
+          typeof info?.id === "string" &&
+          typeof info?.parentID === "string" &&
+          info.parentID !== ""
+        ) {
+          try {
+            sessionStore.markChildSession(info.id);
+            rememberRoleSession(info.id, info.agent); // #84 P2.1: a role child is known before its first tool call (v2 carries the agent)
+          } catch {
+            // best-effort: classification must never crash a real session
+          }
+        }
+        return;
+      }
+
+      if (event?.type !== "session.idle") return;
+      const sid = event?.properties?.sessionID;
+      if (typeof sid !== "string") return;
+
+      // Per-delegation scorecard: only when enforcement was active (guard state exists).
+      try {
+        const gstate = guardStore.get(sid);
+        if (gstate) {
+          const line = formatScorecard(gstate, sessionStore.getTier(sid));
+          const dir = join(tmpdir(), "opencode-model-router-trajectory");
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, `${sid}.scorecard.log`), line + "\n", { flag: "a" });
+        }
+      } catch {
+        // best-effort: a scorecard must never crash a real session
+      }
+
+      // Opt-in full trajectory dump (unchanged gating).
+      if (process.env.MODEL_ROUTER_TRAJECTORY_DEBUG !== "1") return;
+      const dump = trajectoryStore.dump(sid);
+      if (!dump) return;
+      try {
+        const dir = join(tmpdir(), "opencode-model-router-trajectory");
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `${sid}.log`), dump + "\n", { flag: "a" });
+      } catch {
+        // best-effort
+      }
+    },
+
+    // -----------------------------------------------------------------------
+    // Register tier agents + commands at load time
+    // -----------------------------------------------------------------------
+    config: async (opencodeConfig: any) => {
+      opencodeConfig.agent ??= {};
+
+      // Re-read so re-running this hook (v2 refresh) yields the current preset.
+      cfg = loadConfig(projectDir);
+      activeTiers = getActiveTiers(cfg);
+
+      for (const [name, tier] of Object.entries(activeTiers)) {
+        // Resolve prompt: per-tier override wins; otherwise fall back to the
+        // style-appropriate default (goal-oriented or global tierPrompts[name]).
+        const resolvedPrompt = tier.prompt ?? selectTierPrompt(name, tier, cfg);
+
+        // For Claude-backed tiers, prepend an adversarial opener that revokes
+        // the cached "Claude Code exploratory agent" priming for this dispatch.
+        // Detection is by model string, so hybrid presets get the override
+        // only on their Claude-backed tiers.
+        const claudePrefix = isClaudeModel(tier.model)
+          ? cfg.antiNarration
+            ? `${CLAUDE_TIER_PREFIX[name]}\n\n${CLAUDE_ANTI_NARRATION}`
+            : CLAUDE_TIER_PREFIX[name]
+          : undefined;
+        const styledPrompt =
+          claudePrefix && resolvedPrompt
+            ? `${claudePrefix}\n\n---\n\n${resolvedPrompt}`
+            : resolvedPrompt;
+
+        // The tool-authority clause is appended HERE rather than inside each
+        // tier prompt, for three reasons: one copy instead of six; the
+        // style-comparison contracts in test/unit/prompt-style.test.ts compare
+        // goal-oriented against prescriptive length, and adding the same
+        // constant to both sides erodes a ratio it is meant to protect; and a
+        // user-supplied `tier.prompt` bypasses the shipped defaults entirely,
+        // so a clause living in the defaults would not protect the tiers most
+        // likely to be hand-written.
+        const finalPrompt = styledPrompt
+          ? `${styledPrompt}\n\n${TOOL_AUTHORITY_CLAUSE}`
+          : TOOL_AUTHORITY_CLAUSE;
+
+        const agentDef: Record<string, unknown> = {
+          model: tier.model,
+          mode: "subagent",
+          description: tier.description ?? `@${name} tier (${tier.model})`,
+          maxSteps: tier.steps,
+          steps: tier.steps,
+          prompt: finalPrompt,
+          color: tier.color,
+        };
+        if (isReadOnlyTier(name, tier)) {
+          const permission = mergePermissions(readOnlyPermissions(Boolean(opencodeConfig.mcp?.context7)
+            && opencodeConfig.mcp.context7.enabled !== false), opencodeConfig.agent[name]?.permission);
+          agentDef.permission = permission;
+          agentDef.tools = { ...legacyReadOnlyTools(permission), ...opencodeConfig.agent[name]?.tools };
+        } else if (name === "fast" || tier.readOnly === false) {
+          // Opt-out removes OUR policy, not restrictions the user supplied.
+          for (const key of ["permission", "tools"]) {
+            if (opencodeConfig.agent[name]?.[key] !== undefined) agentDef[key] = opencodeConfig.agent[name][key];
+          }
+        }
+
+        // Apply variant (thinking/reasoning mode)
+        if (tier.variant) {
+          agentDef.variant = tier.variant;
+        }
+
+        // Apply provider-specific options
+        const opts = buildAgentOptions(tier, name, logger);
+        if (Object.keys(opts).length > 0) {
+          agentDef.options = opts;
+        }
+        if (typeof opts.effort === "string") {
+          warnAgentOptionsEffortOnce(
+            "anthropic-effort-dependency",
+            "effort on Anthropic models requires the opencode-anthropic-fix plugin (commit 307aea9+ for fable/mythos); non-adaptive Claude models (e.g. haiku) silently strip effort at the API layer, and without the plugin a top-level effort can break Claude-Code billing fingerprinting",
+            logger,
+          );
+        }
+
+        opencodeConfig.agent[name] = agentDef;
+      }
+
+      // Repoint pre-existing subagents listed in `subagentTiers` at the active
+      // preset's models. Opt-in: with no map, nothing here runs and the agent
+      // record is left exactly as opencode built it. Runs after tier
+      // registration so the tier-name collision guard sees the real tiers.
+      // Plugin agents (#81): subagents defined by the router `agents` block.
+      // Model/variant/steps always follow the ACTIVE preset's tier, so this
+      // re-run on /preset rebuilds them. An opencode.json `agent.<name>` entry
+      // wins for the fields it sets (its permission rules go after ours).
+      const context7 = Boolean(opencodeConfig.mcp?.context7) && opencodeConfig.mcp.context7.enabled !== false;
+      const builtNow = new Map<string, Record<string, unknown> | undefined>();
+      const pluginTiers = resolveActiveTiers(cfg);
+      for (const [name, entry] of Object.entries(cfg.agents ?? {})) {
+        const tier = pluginTiers[entry.tier];
+        if (!tier) continue;
+        const existing = opencodeConfig.agent[name];
+        const seed = (opencodeConfig as Record<symbol, unknown>)[HOST_SEED_AGENTS];
+        const fromHostSeed = seed instanceof Set && seed.has(name);
+        if (fromHostSeed && existing?.mode !== undefined && existing.mode !== "subagent") {
+          warnAgentOptionsEffortOnce(`plugin-agent-host-mode:${name}`, `agent ${name} collides with a host built-in agent whose mode is '${String(existing.mode)}'; the router \`agents\` entry is skipped`, logger);
+          continue;
+        }
+        // A definition this hook built on a previous run is not a user entry.
+        const previous = pluginAgentMarker(existing);
+        const hostEntry: Record<string, unknown> | undefined = previous
+          ? previous.hostEntry
+          : existing !== undefined && typeof existing === "object" && existing !== null && !Array.isArray(existing)
+            ? existing as Record<string, unknown>
+            : undefined;
+        let definition = buildPluginAgentDefinition(entry, tier, { context7, host: "v1" });
+        if (hostEntry !== undefined) {
+          definition = mergeHostAgentEntry(definition, hostEntry);
+          warnAgentOptionsEffortOnce(
+            `plugin-agent-host-entry:${name}`,
+            `agent ${name} is defined both in the router \`agents\` block and in ${fromHostSeed ? "a host built-in agent" : "opencode.json"}; ${fromHostSeed ? "the host definition" : "opencode.json"} wins for the fields it sets`,
+            logger,
+          );
+        }
+        opencodeConfig.agent[name] = definition;
+        builtNow.set(name, hostEntry);
+      }
+      // QA-81-8 invariant: after this loop every plugin agent in `opencodeConfig.agent` was built THIS run, or is the host entry
+      // the router replaced (restored), or is absent. Anything built on a previous run and not rebuilt now (removed or invalid) must not linger.
+      // Detection is the symbol marker OR the closure set, so a cloned config (marker lost) is covered too.
+      for (const name of Object.keys(opencodeConfig.agent)) {
+        if (builtNow.has(name)) continue;
+        const marker = pluginAgentMarker(opencodeConfig.agent[name]);
+        if (marker === undefined && !builtPluginAgents.has(name)) continue;
+        const restore = marker ? marker.hostEntry : builtPluginAgents.get(name);
+        if (restore !== undefined) opencodeConfig.agent[name] = restore;
+        else delete opencodeConfig.agent[name];
+      }
+      builtPluginAgents = builtNow;
+
+      const subagentOverrides = resolveSubagentOverrides({
+        subagentTiers: cfg.subagentTiers,
+        tiers: activeTiers,
+        // The built-in list is the v1 host's; on v2 the setup seed already carries the real host agents.
+        existingAgents: ctx.routerHost === "v2" ? opencodeConfig.agent : { ...V1_HOST_BUILTIN_AGENTS, ...opencodeConfig.agent },
+        pluginAgents: cfg.agents,
+        onSkip: (agentName, reason) =>
+          reason === "missing" && opencodeConfig[DEFER_MISSING_SUBAGENT_NOTICE] === true
+            ? undefined
+            : warnAgentOptionsEffortOnce(
+            `subagent-tiers:${reason}:${agentName}`,
+            reason === "missing"
+              ? `subagentTiers: '${agentName}' is not defined in opencode.json or the router \`agents\` block; skipped (the router never creates it)`
+              : `subagentTiers: '${agentName}' is defined by the router \`agents\` block, whose tier wins; entry skipped`,
+            logger,
+          ),
+      });
+      for (const [agentName, override] of Object.entries(subagentOverrides)) {
+        opencodeConfig.agent[agentName] = mergeSubagentOverride(
+          opencodeConfig.agent[agentName],
+          override,
+        );
+      }
+
+      // Register commands
+      opencodeConfig.command ??= {};
+      opencodeConfig.command["tiers"] = {
+        template: "",
+        description: "Show model delegation tiers and rules",
+      };
+      opencodeConfig.command["preset"] = {
+        template: "$ARGUMENTS",
+        description: "Show or switch model presets (e.g., /preset openai)",
+      };
+      opencodeConfig.command["budget"] = {
+        template: "$ARGUMENTS",
+        description:
+          "Show or switch routing mode (e.g., /budget, /budget budget, /budget quality)",
+      };
+      opencodeConfig.command["bypass"] = {
+        template: "$ARGUMENTS",
+        description:
+          "Toggle model-router bypass (disables delegation protocol for this session)",
+      };
+      opencodeConfig.command["annotate-plan"] = {
+        template: [
+          "Annotate the plan with tier directives for model delegation.",
+          "",
+          'Plan file: "$ARGUMENTS"',
+          "If no file was specified, search for the active plan: PLAN.md, plan.md, or the most recent .md with 'plan' in the name in the current directory or project root.",
+          "",
+          "## Available tiers",
+          "- `[tier:fast]` — Fast/cheap model: exploration, search, file reads, grep, listing, research. Agent does NOT edit code.",
+          "- `[tier:medium]` — Balanced model: implementation, refactoring, tests, code review, bug fixes, standard coding tasks.",
+          "- `[tier:heavy]` — Most capable model: architecture, complex debugging (after failures), security, performance, multi-system tradeoffs.",
+          "",
+          "## Annotation rules",
+          "1. Place `[tier:X]` at the START of each step, before the description",
+          "2. Research/exploration -> `[tier:fast]` (preferred)",
+          "3. Implementation/code -> `[tier:medium]` (preferred)",
+          "4. Architecture/security/hard debugging -> `[tier:heavy]`",
+          "5. If a step mixes exploration AND implementation, prefer splitting it into two steps when it improves delegation clarity",
+          "6. Verification (run tests, build) -> `[tier:medium]`",
+          "7. Trivial (single grep or file read) -> `[tier:fast]`",
+          "8. Final review of the complete plan -> `[tier:heavy]`",
+          "",
+          "## Output",
+          "Rewrite the entire plan in the file with the tags. Do not change the substance — only add tags, and split mixed steps when useful for clearer delegation.",
+          "",
+          "## Acceptance blocks (for enforcement)",
+          "For each NON-TRIVIAL task, append an acceptance block immediately after the step so the router can verify the work:",
+          "[acceptance]",
+          "check: <testsPass | buildPasses | lintClean | fileExists path=... | run command=\"...\" expect=...>",
+          "criteria: <plain-language success condition, when no deterministic check applies>",
+          "deliverable: <path or short description>",
+          "[/acceptance]",
+          "Prefer deterministic checks (testsPass/buildPasses/fileExists). testsPass means the tests affected by the producer's changes pass (the full suite is CI's job), so prefer it over a hand-written full-suite run command. Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
+        ].join("\n"),
+        description:
+          "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
+      };
+      opencodeConfig.command["router-reload"] = {
+        template: "",
+        description:
+          ctx.routerHost === "v2"
+            ? "Reload model-router config (tiers.json, overrides, state) without restarting"
+            : "Reload model-router config (tiers.json, overrides, state); subagent models apply after an opencode restart",
+      };
+      opencodeConfig.command["router"] = {
+        template: "$ARGUMENTS",
+        description:
+          "Model-router controls (e.g., /router enforce off|advisory|enforced, /router overrides, /router models)",
+      };
+    },
+
+    // -----------------------------------------------------------------------
+    // Inject delegation protocol — uses cached config (invalidated on /preset or /budget)
+    // Only inject for the primary orchestrator, NOT for subagent calls.
+    // Subagents get confused by delegation instructions when they should
+    // just execute a task (especially smaller models like Haiku).
+    // -----------------------------------------------------------------------
+    "experimental.chat.system.transform": async (_input: any, output: any) => {
+      if (bypassed) return;
+      try {
+        cfg = loadConfig(projectDir); // Returns cache unless invalidated
+        warnConfigIssues(cfg, logger);
+      } catch {
+        // Use last known config if file read fails
+      }
+
+      // Inject ONLY when this is provably the top-level orchestrator session.
+      //
+      // Fail CLOSED. The old guard was `sessionID && isSubagent(sessionID)`,
+      // which injected whenever the session could not be proven to be a child.
+      // Both failure directions are not equal: a missed injection costs the
+      // orchestrator its routing rules, while a spurious injection tells a
+      // subagent it is an orchestrator that MUST delegate with a `task` tool it
+      // does not have — and a literal-minded model then refuses the dispatch
+      // outright instead of doing the work.
+      const sessionID = _input?.sessionID;
+      if (typeof sessionID !== "string" || sessionID === "") {
+        warnMissingTransformSessionOnce();
+        return;
+      }
+      // graderSessions is checked separately from isSubagent because it is
+      // populated synchronously the instant client.session.create resolves,
+      // whereas the session.created event that feeds markChildSession may not
+      // have arrived yet. A grader told to orchestrate stalls until its budget
+      // expires.
+      const isChild =
+        graderSessions.has(sessionID) ||
+        sessionStore.isSubagent(sessionID) ||
+        !(await resolveIsRootSession(sessionID));
+
+      if (isChild) {
+        if (process.env.MODEL_ROUTER_SYSTEM_DEBUG === "1" && !systemDebugLogged) {
+          systemDebugLogged = true;
+          try {
+            const dir = join(tmpdir(), "opencode-model-router-trajectory");
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, "system.log"), JSON.stringify({
+              length: output.system.length,
+              entries: output.system.map((entry: string) => entry.slice(0, 60)),
+            }) + "\n", { flag: "a" });
+          } catch {
+            // Best-effort opt-in diagnostics must never break a real session.
+          }
+        }
+        stripDelegateInstructions(output, cfg, ctx.directory);
+        return;
+      }
+
+      // For Claude-backed orchestrators, prepend an adversarial opener that
+      // revokes the cached "Claude Code explorer" priming for the routing
+      // role. Detection is by orchestrator model, not preset.
+      const providerID = _input?.model?.providerID ?? "";
+      const modelID = _input?.model?.modelID ?? "";
+      const orchestratorModel = providerID && modelID ? `${providerID}/${modelID}` : modelID;
+      if (providerID !== "") lastPrimary = { providerID, modelID: modelID === "" ? null : modelID };
+
+      let enfOn = false;
+      try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
+      // #84 P2.1 (T2.1.3): v2 roles mode carries the roles protocol (P2.2); "" (v1, tiers mode, no enabled role) keeps today's prompt.
+      const rolesPrompt = isV2Host ? assembleRolesSystemPrompt(cfg, rolesNow(), orchestratorModel, enfOn) : "";
+      let systemPrompt = rolesPrompt !== "" ? rolesPrompt : assembleSystemPrompt(cfg, orchestratorModel, enfOn);
+      // A28 (D1): on v1 only, and only with an explicit `routing.roles`, the `R:` line lists those agents as destinations (prose; no model
+      // override). Anything else leaves `systemPrompt` the very string it is: the v1 protocol stays byte-identical.
+      // Any failure leaves the baseline prompt (QA-2.4-13): the line is an extra, never a reason to lose the protocol.
+      if (ctx.routerHost !== "v2") {
+        const baseline = systemPrompt;
+        try {
+          if (hasExplicitV1Roles(cfg, logger)) systemPrompt = applyV1Roles(baseline, cfg, v1AgentsNow(), logger);
+        } catch (error) {
+          systemPrompt = baseline;
+          logger.warn("[router] routing.roles: the R: line could not be extended; the protocol is unchanged", { error: describeError(error) });
+        }
+      }
+      output.system.push(systemPrompt);
+
+      // 2.4.3: the cost doctor's throttled check. `poll` is O(1) when nothing is due and never throws. In static/shadow a notice is logged
+      // from here; in advise/enforce it is delivered with the user's next turn (the `chat.message` hook below), never in the system prompt:
+      // a system part that changes would cost the orchestrator its prompt cache (QA-2.4-9).
+      advisorNotifier?.poll();
+
+      // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
+      // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
+      // does not grow for sessions that never defer. Orchestrator path only: every child returned
+      // above. With background mode on, an entry the queue is verifying right now is still
+      // unverified to the orchestrator, so it stays listed until its run settles.
+      try {
+        // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
+        const open = pending.listPending(sessionID, { verifying: background !== undefined });
+        const block = buildPendingListBlock(open);
+        if (block !== undefined) output.system.push(block);
+      } catch (error) {
+        logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
+      }
+      // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
+      // not pass, each delivered once (takeNotices marks them delivered).
+      if (background !== undefined) {
+        try {
+          const late = buildLateNoticeBlock(background.takeNotices(sessionID));
+          if (late !== undefined) output.system.push(late);
+        } catch (error) {
+          logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+        }
+      }
+    },
+
+    // -----------------------------------------------------------------------
+    // Handle /tiers, /preset, and /budget commands
+    // -----------------------------------------------------------------------
+    "command.execute.before": async (input: any, output: any) => {
+      if (input.command === "tiers") {
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        output.parts.push({
+          type: "text" as const,
+          text: buildTiersOutput(cfg),
+        });
+      }
+
+      if (input.command === "annotate-plan") {
+        // 2.4.4: the template (registered in the config hook) is unchanged. With a live engine on v2 this adds ONE message part: the
+        // route lines the router computed for the plan's steps (one batched classification). Everything else is as before.
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        try {
+          const runtime = annotatePlanRuntime();
+          if (runtime !== undefined && ctx.routerAgents !== undefined) {
+            const directives = await buildAnnotateDirectives(input.arguments ?? "", {
+              cfg,
+              runtime,
+              listAgents: ctx.routerAgents,
+              dirs: [...new Set([ctx.directory, ctx.worktree].filter((dir): dir is string => typeof dir === "string" && dir !== ""))],
+              logger,
+            });
+            if (directives !== null) output.parts.push({ type: "text" as const, text: directives });
+          }
+        } catch (error) {
+          // No part: the command is then exactly what it was (QA-2.4-15).
+          logger.warn("[router] /annotate-plan: route lines unavailable; the plan is annotated without them", { error: describeError(error) });
+        }
+      }
+
+      if (input.command === "router-reload") {
+        invalidateConfigCache();
+        cfg = loadConfig(projectDir);
+        activeTiers = getActiveTiers(cfg);
+        const mapping = Object.entries(activeTiers)
+          .map(([name, tier]) => `  ${name} -> ${tier.model}`)
+          .join("\n");
+        const reloadError = getConfigReloadError(projectDir);
+        output.parts.push({
+          type: "text" as const,
+          text: [
+            ...(reloadError
+              ? [
+                  `Config reload FAILED — keeping last valid config:\n${reloadError}`,
+                  "Model router is still using the last valid config.",
+                ]
+              : ["Model router config reloaded."]),
+            `Preset: ${cfg.activePreset}`,
+            `Mode: ${cfg.activeMode ?? "normal"}`,
+            "Tiers:",
+            mapping,
+            // opencode v1 builds its agent registry once at startup; only the v2
+            // adapter re-runs the config hook + agent reload after /router-reload.
+            ...(ctx.routerHost === "v2"
+              ? []
+              : [
+                  "Note: opencode v1 keeps subagent (task) models from startup; restart opencode to apply tier model changes to subagents. Routing and protocol already use the new config.",
+                ]),
+          ].join("\n"),
+        });
+      }
+
+      if (input.command === "preset") {
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        output.parts.push({
+          type: "text" as const,
+          text: buildPresetOutput(cfg, input.arguments ?? "", projectDir),
+        });
+      }
+
+      if (input.command === "bypass") {
+        const arg = (input.arguments ?? "").trim().toLowerCase();
+        if (arg === "on") {
+          bypassed = true;
+        } else if (arg === "off") {
+          bypassed = false;
+        } else {
+          bypassed = !bypassed;
+        }
+        output.parts.push({
+          type: "text" as const,
+          text: buildBypassMessage(bypassed),
+        });
+      }
+
+      if (input.command === "budget") {
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        output.parts.push({
+          type: "text" as const,
+          text: buildBudgetOutput(cfg, input.arguments ?? "", projectDir),
+        });
+      }
+
+      if (input.command === "router") {
+        try {
+          cfg = loadConfig(projectDir);
+          warnConfigIssues(cfg, logger);
+        } catch {}
+        const args = (input.arguments ?? "").trim();
+        const parts = args.split(/\s+/).filter(Boolean);
+        const sub = (parts[0] ?? "").toLowerCase();
+        let text: string;
+        if (sub === "models") {
+          const catalog = await fetchCatalog();
+          const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
+          text = buildModelsOutput(catalog, parts.slice(1).join(" "), orphans);
+        } else if (sub === "stats" && cfg.routing !== undefined) {
+          // 2.4.5 (D18): the table of `npm run routing:stats`, run by the very same driver over the configured store.
+          try {
+            text = formatStatsReply(await runStatsCommand(parts.slice(1).join(" "), { cfg, host: ctx.routerHost === "v2" ? "v2" : "v1", logger }));
+          } catch (error) {
+            logger.warn("[router] /router stats failed", { error: describeError(error) });
+            text = `routing-stats: ${describeError(error)}`;
+          }
+        } else {
+          // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined);
+          // On the bare status view, surface stale or missing models inline.
+          if (sub === "") {
+            text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
+            // 2.4.5: the last dogfood checkpoint recorded next to this code (omitted when there is none). Only with a `routing` block:
+            // without one `/router` is exactly what it was (QA-2.4-3, §1.2).
+            const optedIn = cfg.routing !== undefined;
+            const checkpoint = optedIn ? checkpointLine() : null;
+            if (checkpoint !== null) text += "\n" + checkpoint;
+            // One `config.providers()` call serves the model check below and the cost doctor.
+            const fetched = await fetchCatalogRaw();
+            const catalog = fetched?.catalog ?? null;
+            if (catalog) {
+              const issues = validateModels(cfg, catalog);
+              if (issues.length > 0) {
+                text += "\n\n" + formatModelIssues(issues);
+              }
+            }
+            // 2.4.3: the cost doctor (v2 only, and only with a `routing` block; the advisor needs the v2 agent list and catalog).
+            if (ctx.routerHost === "v2" && optedIn) {
+              try {
+                text += "\n\n" + (await buildCostDoctorLines(fetched)).join("\n");
+              } catch (error) {
+                logger.warn("[router] cost doctor failed", { error: describeError(error) });
+                text += `\n\nCost doctor: unavailable (${describeError(error)}).`;
+              }
+            }
+          }
+        }
+        output.parts.push({ type: "text" as const, text });
+      }
+    },
+  };
+};
+
+export default ModelRouterPlugin;

@@ -1,0 +1,1376 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdirSync, writeFileSync, rmSync, realpathSync, utimesSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import {
+  deepMerge,
+  loadConfig,
+  invalidateConfigCache,
+  overridePath,
+  localOverridePath,
+  findProjectOverride,
+  writeState,
+  configPath,
+  statePath,
+  getConfigReloadError,
+} from "../../src/router/config";
+
+// Switch used by the "cannot be read" test below to make exactly one path fail
+// at the fs boundary. `vi.mock` factories are hoisted above the imports, so the
+// flag it closes over has to be hoisted alongside them. Every other path — the
+// bundled tiers.json included — delegates to the real implementation, so this is
+// inert for every other test in this file.
+const fsMock = vi.hoisted(() => ({
+  unreadablePath: null as string | null,
+  // Makes statSync throw for exactly one path, as when a parent directory loses
+  // search permission (EACCES) or hits a transient I/O error (EIO). Everything
+  // that stats a config source — the fingerprint, the override/state lookups and
+  // the override walk — goes through statSync.
+  unstatablePath: null as string | null,
+  unstatableCode: "EACCES",
+  // Maps a "symlinked" path to what realpathSync should resolve it to. Used by
+  // the $HOME boundary test: creating a real symlink needs elevated privileges
+  // on Windows, so the link is faked at the fs boundary instead of on disk.
+  realpaths: new Map<string, string>(),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    default: actual,
+    readFileSync: (path: unknown, ...rest: unknown[]) => {
+      if (fsMock.unreadablePath !== null && String(path) === fsMock.unreadablePath) {
+        const err = new Error(
+          `EACCES: permission denied, open '${String(path)}'`,
+        ) as NodeJS.ErrnoException;
+        err.code = "EACCES";
+        throw err;
+      }
+      return (actual.readFileSync as (...a: unknown[]) => unknown)(path, ...rest);
+    },
+    statSync: (path: unknown, ...rest: unknown[]) => {
+      if (fsMock.unstatablePath !== null && String(path) === fsMock.unstatablePath) {
+        const err = new Error(
+          `${fsMock.unstatableCode}: cannot stat '${String(path)}'`,
+        ) as NodeJS.ErrnoException;
+        err.code = fsMock.unstatableCode;
+        throw err;
+      }
+      return (actual.statSync as (...a: unknown[]) => unknown)(path, ...rest);
+    },
+    realpathSync: (path: unknown, ...rest: unknown[]) => {
+      const mapped = fsMock.realpaths.get(String(path));
+      if (mapped !== undefined) return mapped;
+      return (actual.realpathSync as (...a: unknown[]) => unknown)(path, ...rest);
+    },
+  };
+});
+
+// The bundled github-copilot heavy tier, read straight from tiers.json. These
+// tests are about merge/fallback behaviour, not about which model a preset
+// happens to pin, so they assert against the bundled values rather than
+// hard-coded model IDs — a preset bump must not break the override suite.
+const BUNDLED_HEAVY = JSON.parse(
+  readFileSync(join(__dirname, "../../tiers.json"), "utf-8"),
+).presets["github-copilot"].heavy as {
+  model: string;
+  costRatio: number;
+  steps: number;
+  description: string;
+};
+
+// ---------------------------------------------------------------------------
+// deepMerge — pure unit tests
+// ---------------------------------------------------------------------------
+
+describe("deepMerge", () => {
+  it("merges nested objects key-by-key, leaving untouched keys intact", () => {
+    const base = { a: { x: 1, y: 2 }, b: 3 };
+    const out = deepMerge(base, { a: { y: 9 } });
+    expect(out).toEqual({ a: { x: 1, y: 9 }, b: 3 });
+  });
+
+  it("ignores __proto__ and constructor keys rather than reparenting", () => {
+    const out = deepMerge(
+      { a: 1 },
+      JSON.parse('{"__proto__": {"polluted": true}, "b": 2}'),
+    ) as Record<string, unknown>;
+    expect(out).toEqual({ a: 1, b: 2 });
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("replaces arrays wholesale (no concatenation)", () => {
+    const out = deepMerge({ list: [1, 2, 3] }, { list: [9] });
+    expect(out).toEqual({ list: [9] });
+  });
+
+  it("replaces scalars", () => {
+    expect(deepMerge({ a: 1 }, { a: 2 })).toEqual({ a: 2 });
+  });
+
+  it("skips undefined override values so base survives", () => {
+    expect(deepMerge({ a: 1, b: 2 }, { a: undefined })).toEqual({ a: 1, b: 2 });
+  });
+
+  it("returns the override when either side is not a plain object", () => {
+    expect(deepMerge(5, { a: 1 })).toEqual({ a: 1 });
+    expect(deepMerge({ a: 1 }, [1, 2])).toEqual([1, 2]);
+    expect(deepMerge({ a: 1 }, null)).toBe(null);
+  });
+
+  it("preserves sibling tier fields when overriding only one key (canonical case)", () => {
+    const base = {
+      heavy: { model: "old", variant: "high", costRatio: 20, steps: 120 },
+    };
+    const out = deepMerge(base, { heavy: { model: "new" } }) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(out.heavy).toEqual({
+      model: "new",
+      variant: "high",
+      costRatio: 20,
+      steps: 120,
+    });
+  });
+
+  it("does not mutate the base object", () => {
+    const base = { a: { x: 1 } };
+    deepMerge(base, { a: { x: 2 } });
+    expect(base.a.x).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadConfig — override file integration (HOME redirected to a temp dir so the
+// real ~/.config/opencode files are never touched).
+// ---------------------------------------------------------------------------
+
+describe("loadConfig — user overrides file", () => {
+  let tmpHome: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    tmpHome = join(
+      tmpdir(),
+      `oc-mr-overrides-${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`,
+    );
+    mkdirSync(tmpHome, { recursive: true });
+    process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    try {
+      rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } catch {
+      // best-effort cleanup
+    }
+    invalidateConfigCache();
+  });
+
+  function writeOverride(content: string): void {
+    const p = overridePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, content, "utf-8");
+    invalidateConfigCache();
+  }
+
+  it("returns the bundled config unchanged when no override file exists", () => {
+    const cfg = loadConfig();
+    expect(cfg.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns the identical object while no source file changed", () => {
+    writeOverride(JSON.stringify({ activePreset: "github-copilot" }));
+    expect(loadConfig()).toBe(loadConfig());
+  });
+
+  it("reloads on mtime/size change without an explicit invalidate", () => {
+    writeOverride(
+      JSON.stringify({ presets: { "github-copilot": { heavy: { model: "x/one" } } } }),
+    );
+    const first = loadConfig();
+    expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+
+    const p = overridePath();
+    writeFileSync(
+      p,
+      JSON.stringify({ presets: { "github-copilot": { heavy: { model: "x/two-longer" } } } }),
+      "utf-8",
+    );
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(p, later, later);
+
+    const second = loadConfig();
+    expect(second).not.toBe(first);
+    expect(second.presets["github-copilot"]!.heavy!.model).toBe("x/two-longer");
+  });
+
+  // activePreset is the likeliest key to typo in a hand-edited file. It used to
+  // load clean and leave routing on whatever the bundled default was, saying
+  // nothing at all.
+  it("warns and drops the layer when activePreset names no known preset", () => {
+    writeOverride(JSON.stringify({ activePreset: "no-such-preset-xyz" }));
+    const cfg = loadConfig();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no-such-preset-xyz"),
+    );
+    // fell back to the bundled default rather than adopting the bad name
+    expect(cfg.activePreset).not.toBe("no-such-preset-xyz");
+    expect(cfg.presets[cfg.activePreset]).toBeDefined();
+  });
+
+  it("accepts activePreset naming a preset the override itself defines", () => {
+    writeOverride(
+      JSON.stringify({
+        presets: { local: { fast: { model: "local/qwen3" } } },
+        activePreset: "local",
+      }),
+    );
+    expect(loadConfig().activePreset).toBe("local");
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  // An unreadable file is the one fallback path that used to say nothing, which
+  // made a permissions problem indistinguishable from having no override at all.
+  it("warns when an override file exists but cannot be read", () => {
+    const p = overridePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify({ activePreset: "anthropic" }), "utf-8");
+    // Fail the read at the fs boundary rather than via chmod: mode bits are
+    // ignored when running as root and largely do not apply on Windows, so the
+    // old approach silently asserted nothing on two very common platforms.
+    fsMock.unreadablePath = p;
+    invalidateConfigCache();
+    try {
+      loadConfig();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("cannot read it"),
+      );
+    } finally {
+      fsMock.unreadablePath = null;
+    }
+  });
+
+  it("accepts activePreset in a different case, matching /preset resolution", () => {
+    writeOverride(JSON.stringify({ activePreset: "AnThRoPiC" }));
+    expect(loadConfig().presets.anthropic).toBeDefined();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("deep-merges a single tier model, preserving sibling fields", () => {
+    writeOverride(
+      JSON.stringify({
+        presets: {
+          "github-copilot": { heavy: { model: "github-copilot/custom-opus" } },
+        },
+      }),
+    );
+    const heavy = loadConfig().presets["github-copilot"]!.heavy!;
+    expect(heavy.model).toBe("github-copilot/custom-opus");
+    // sibling fields from the bundled config survive the merge
+    expect(heavy.costRatio).toBe(BUNDLED_HEAVY.costRatio);
+    expect(heavy.steps).toBe(BUNDLED_HEAVY.steps);
+    expect(heavy.description).toBe(BUNDLED_HEAVY.description);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("honors activePreset set in the override file (as a default)", () => {
+    writeOverride(JSON.stringify({ activePreset: "openai" }));
+    expect(loadConfig().activePreset).toBe("openai");
+  });
+
+  it("lets the persisted state file's activePreset win over the override", () => {
+    writeOverride(JSON.stringify({ activePreset: "openai" }));
+    writeState({ activePreset: "google" }); // runtime /preset selection
+    invalidateConfigCache();
+    expect(loadConfig().activePreset).toBe("google");
+  });
+
+  it("supports comments and trailing commas in the overrides file", () => {
+    writeOverride(`{
+      // override just the heavy model for github-copilot
+      "presets": {
+        "github-copilot": {
+          "heavy": { "model": "github-copilot/custom-opus" }, /* trailing comma → */
+        },
+      },
+    }`);
+    expect(loadConfig().presets["github-copilot"]!.heavy!.model).toBe(
+      "github-copilot/custom-opus",
+    );
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("can add an entirely new preset with only `model` per tier", () => {
+    writeOverride(
+      JSON.stringify({
+        presets: {
+          local: {
+            fast: { model: "local/qwen3.6-27b-mtp" },
+            medium: { model: "local/qwen3.6-27b-mtp" },
+            heavy: { model: "local/qwen3.6-27b-mtp" },
+          },
+        },
+        activePreset: "local",
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.activePreset).toBe("local");
+    expect(cfg.presets.local!.heavy!.model).toBe("local/qwen3.6-27b-mtp");
+    expect(warnSpy).not.toHaveBeenCalled(); // no validation failure → layer not dropped
+
+    // name-based defaults are filled in for the omitted costRatio/steps
+    const local = cfg.presets.local!;
+    expect([local.fast!.costRatio, local.fast!.steps]).toEqual([1, 30]);
+    expect([local.medium!.costRatio, local.medium!.steps]).toEqual([5, 50]);
+    expect([local.heavy!.costRatio, local.heavy!.steps]).toEqual([20, 120]);
+  });
+
+  it("warns and falls back to bundled config on invalid JSON", () => {
+    writeOverride("{ not valid json ");
+    const cfg = loadConfig();
+    expect(cfg.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("invalid JSON"),
+    );
+  });
+
+  it("warns and falls back when the override root is not an object", () => {
+    writeOverride(JSON.stringify(["not", "an", "object"]));
+    const cfg = loadConfig();
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-haiku-5-5");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("expected a JSON object at root"),
+    );
+  });
+
+  it("warns and falls back when the merged config fails validation", () => {
+    // model must be a non-empty string; a number makes the merged config invalid
+    writeOverride(
+      JSON.stringify({ presets: { anthropic: { fast: { model: 123 } } } }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-haiku-5-5");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("must be a non-empty string"),
+    );
+  });
+
+  // The provider-less ref is the realistic mistake — it looks like a model name,
+  // so it reads as correct. What matters is that rejecting it at load DEGRADES:
+  // the layer is dropped and the bundled config stands, rather than the plugin
+  // failing to start. Reported in #17.
+  it("drops the layer, without bricking startup, when a model ref has no provider", () => {
+    writeOverride(
+      JSON.stringify({
+        presets: { anthropic: { fast: { model: "claude-sonnet-5" } } },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/claude-haiku-5-5");
+    // and the warning names the offending value, not just the field
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("must be 'provider/model' (got 'claude-sonnet-5')"),
+    );
+  });
+
+  // Hot reload: once a config has loaded, a source that later turns invalid
+  // (a half-saved override, a corrupt state file, a broken tiers.json) must not
+  // throw or silently revert to the base tiers — the last valid config keeps
+  // serving and the reason is surfaced via getConfigReloadError().
+  describe("hot reload resilience", () => {
+    let bump = 0;
+
+    /** Rewrite the override in place and move its mtime forward. */
+    function rewriteOverride(content: string): void {
+      const p = overridePath();
+      writeFileSync(p, content, "utf-8");
+      bump += 60_000;
+      const later = new Date(Date.now() + bump);
+      utimesSync(p, later, later);
+    }
+
+    const goodOverride = (model: string): string =>
+      JSON.stringify({ presets: { "github-copilot": { heavy: { model } } } });
+
+    const reloadWarnings = (): number =>
+      warnSpy.mock.calls.filter((c: unknown[]) =>
+        String(c[0]).includes("config reload failed"),
+      ).length;
+
+    it("keeps the last valid config when the override becomes invalid JSONC, then recovers", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+      expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+      expect(getConfigReloadError()).toBeNull();
+
+      rewriteOverride('{ "presets": { "github-copilot": { "heavy": { "model": ');
+      const second = loadConfig();
+      expect(second).toBe(first);
+      expect(second.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+      const err = getConfigReloadError();
+      expect(err).not.toBeNull();
+      expect(err).toContain(overridePath());
+      expect(err).toContain("invalid JSONC");
+
+      // Fixing the file clears the error and picks up the new content.
+      rewriteOverride(goodOverride("x/fixed-model"));
+      const third = loadConfig();
+      expect(third).not.toBe(first);
+      expect(third.presets["github-copilot"]!.heavy!.model).toBe("x/fixed-model");
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("does not re-warn or rebuild after a failure until a file changes", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+
+      rewriteOverride("{ not json");
+      expect(loadConfig()).toBe(first);
+      expect(reloadWarnings()).toBe(1);
+      warnSpy.mockClear();
+
+      // Same fingerprint: served from cache, silently.
+      expect(loadConfig()).toBe(first);
+      expect(loadConfig()).toBe(first);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(getConfigReloadError()).toContain(overridePath());
+
+      // An explicit reload retries (the loader's own parse warning fires again)
+      // but the reload-failure warning is still emitted once per fingerprint.
+      invalidateConfigCache();
+      expect(loadConfig()).toBe(first);
+      expect(reloadWarnings()).toBe(0);
+      expect(getConfigReloadError()).toContain(overridePath());
+    });
+
+    it("keeps the last valid config when the override fails validation on reload", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+
+      // Parses fine but a provider-less model ref is rejected by validation.
+      rewriteOverride(goodOverride("no-provider"));
+      expect(loadConfig()).toBe(first);
+      expect(getConfigReloadError()).toContain(overridePath());
+      expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+
+      rewriteOverride(goodOverride("x/two"));
+      const fixed = loadConfig();
+      expect(fixed.presets["github-copilot"]!.heavy!.model).toBe("x/two");
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("keeps the last valid config when the state file becomes corrupt on reload", () => {
+      const first = loadConfig();
+      const sp = statePath();
+      mkdirSync(dirname(sp), { recursive: true });
+      writeFileSync(sp, "{ corrupt", "utf-8");
+      const later = new Date(Date.now() + 120_000);
+      utimesSync(sp, later, later);
+
+      expect(loadConfig()).toBe(first);
+      expect(getConfigReloadError()).toContain(sp);
+
+      writeFileSync(sp, JSON.stringify({ activeMode: "no-such-mode" }), "utf-8");
+      const later2 = new Date(Date.now() + 240_000);
+      utimesSync(sp, later2, later2);
+      expect(loadConfig()).not.toBe(first);
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("keeps the last valid config when tiers.json becomes unreadable on reload", () => {
+      const first = loadConfig();
+      try {
+        fsMock.unreadablePath = configPath();
+        invalidateConfigCache();
+        expect(loadConfig()).toBe(first);
+        expect(getConfigReloadError()).toContain(configPath());
+        expect(getConfigReloadError()).toContain("EACCES");
+      } finally {
+        fsMock.unreadablePath = null;
+      }
+
+      invalidateConfigCache();
+      const recovered = loadConfig();
+      expect(recovered).not.toBe(first);
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    // A file that merely becomes unreachable (a parent directory loses search
+    // permission, a transient I/O error) has not been removed: only ENOENT means
+    // removal, so anything else must keep the last valid config instead of
+    // swapping in lower-priority defaults.
+    it("keeps the last valid config when the override becomes unreachable (EACCES), then recovers", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+      expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+
+      try {
+        fsMock.unstatablePath = overridePath();
+        const second = loadConfig();
+        expect(second).toBe(first);
+        expect(second.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+        const err = getConfigReloadError();
+        expect(err).not.toBeNull();
+        expect(err).toContain(overridePath());
+        expect(err).toContain("EACCES");
+
+        // Same fingerprint: served from the cache, error retained, no rebuild.
+        expect(loadConfig()).toBe(first);
+        expect(getConfigReloadError()).toContain("EACCES");
+      } finally {
+        fsMock.unstatablePath = null;
+      }
+
+      // Access restored: the stat succeeds again, so the file is re-read.
+      const recovered = loadConfig();
+      expect(recovered).not.toBe(first);
+      expect(recovered.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("treats a transient I/O error (EIO) on the override like any other non-ENOENT error", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+
+      try {
+        fsMock.unstatablePath = overridePath();
+        fsMock.unstatableCode = "EIO";
+        expect(loadConfig()).toBe(first);
+        expect(getConfigReloadError()).toContain("EIO");
+      } finally {
+        fsMock.unstatablePath = null;
+        fsMock.unstatableCode = "EACCES";
+      }
+
+      expect(loadConfig().presets["github-copilot"]!.heavy!.model).toBe("x/one");
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("still applies the lower-priority config, without an error, when the override is removed (ENOENT)", () => {
+      writeOverride(goodOverride("x/one"));
+      const first = loadConfig();
+      expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/one");
+
+      rmSync(overridePath());
+      const second = loadConfig();
+      expect(second).not.toBe(first);
+      expect(second.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("keeps the last valid config when the state file becomes unreachable, instead of reverting the preset", () => {
+      const base = loadConfig();
+      const target = base.activePreset === "anthropic" ? "github-copilot" : "anthropic";
+      const sp = statePath();
+      mkdirSync(dirname(sp), { recursive: true });
+      writeFileSync(sp, JSON.stringify({ activePreset: target }), "utf-8");
+      invalidateConfigCache();
+      const first = loadConfig();
+      expect(first.activePreset).toBe(target);
+
+      try {
+        fsMock.unstatablePath = sp;
+        expect(loadConfig()).toBe(first);
+        expect(first.activePreset).toBe(target);
+        expect(getConfigReloadError()).toContain(sp);
+        expect(getConfigReloadError()).toContain("EACCES");
+      } finally {
+        fsMock.unstatablePath = null;
+      }
+
+      const recovered = loadConfig();
+      expect(recovered.activePreset).toBe(target);
+      expect(getConfigReloadError()).toBeNull();
+
+      // Removing the state file (ENOENT) is a real removal: the default applies.
+      rmSync(sp);
+      const removed = loadConfig();
+      expect(removed.activePreset).toBe(base.activePreset);
+      expect(getConfigReloadError()).toBeNull();
+    });
+
+    it("on first load, warns and skips an override that cannot be stat'd instead of throwing", () => {
+      writeOverride(goodOverride("x/one"));
+      try {
+        fsMock.unstatablePath = overridePath();
+        const cfg = loadConfig();
+        expect(cfg.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
+        expect(getConfigReloadError()).toBeNull();
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("cannot read it"));
+      } finally {
+        fsMock.unstatablePath = null;
+      }
+    });
+
+    it("on first load, still warns and skips a broken override instead of failing", () => {
+      writeOverride("{ not json");
+      const cfg = loadConfig();
+      expect(cfg.presets["github-copilot"]!.heavy!.model).toBe(BUNDLED_HEAVY.model);
+      expect(getConfigReloadError()).toBeNull();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("invalid JSONC"));
+    });
+
+    it("does not let an override that was already broken at startup block later reloads", () => {
+      writeOverride("{ not json");
+      const first = loadConfig();
+
+      // e.g. /preset persists state and invalidates the cache; the pre-existing
+      // broken override must not stop the new state from taking effect.
+      const target = first.activePreset === "anthropic" ? "github-copilot" : "anthropic";
+      const sp = statePath();
+      mkdirSync(dirname(sp), { recursive: true });
+      writeFileSync(sp, JSON.stringify({ activePreset: target }), "utf-8");
+      invalidateConfigCache();
+
+      const second = loadConfig();
+      expect(second).not.toBe(first);
+      expect(second.activePreset).toBe(target);
+      expect(getConfigReloadError()).toBeNull();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadConfig — global + project-local override hierarchy. HOME drives the global
+// file; process.cwd() drives the project-local file. Both are redirected to
+// temp dirs so the real environment is never touched.
+// ---------------------------------------------------------------------------
+
+describe("loadConfig — global + project override hierarchy", () => {
+  let tmpHome: string;
+  let tmpProject: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let savedCwd: string;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    savedCwd = process.cwd();
+    const stamp = `${process.pid}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+    tmpHome = join(tmpdir(), `oc-mr-home-${stamp}`);
+    tmpProject = join(tmpdir(), `oc-mr-proj-${stamp}`);
+    mkdirSync(tmpHome, { recursive: true });
+    mkdirSync(tmpProject, { recursive: true });
+    process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
+    process.chdir(tmpProject);
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    process.chdir(savedCwd);
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    for (const d of [tmpHome, tmpProject]) {
+      try {
+        rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    invalidateConfigCache();
+  });
+
+  function writeGlobal(obj: unknown): void {
+    const p = overridePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(obj), "utf-8");
+  }
+
+  function writeLocal(obj: unknown): void {
+    const p = localOverridePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(obj), "utf-8");
+  }
+
+  it("keeps the last valid config when the project override becomes unreachable (EACCES), then recovers", () => {
+    writeLocal({ presets: { "github-copilot": { heavy: { model: "x/project" } } } });
+    const first = loadConfig();
+    expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/project");
+    const projectFile = findProjectOverride();
+    expect(projectFile).toBeDefined();
+
+    try {
+      fsMock.unstatablePath = projectFile!;
+      // The unreachable candidate must neither vanish from the walk (which would
+      // fall back to the global/bundled config) nor be skipped for an ancestor.
+      expect(findProjectOverride()).toBe(projectFile);
+      expect(loadConfig()).toBe(first);
+      const err = getConfigReloadError();
+      expect(err).toContain(projectFile!);
+      expect(err).toContain("EACCES");
+    } finally {
+      fsMock.unstatablePath = null;
+    }
+
+    const recovered = loadConfig();
+    expect(recovered).not.toBe(first);
+    expect(recovered.presets["github-copilot"]!.heavy!.model).toBe("x/project");
+    expect(getConfigReloadError()).toBeNull();
+  });
+
+  it("applies the lower-priority config, without an error, when the project override is removed (ENOENT)", () => {
+    writeGlobal({ presets: { "github-copilot": { heavy: { model: "x/global" } } } });
+    writeLocal({ presets: { "github-copilot": { heavy: { model: "x/project" } } } });
+    const first = loadConfig();
+    expect(first.presets["github-copilot"]!.heavy!.model).toBe("x/project");
+
+    rmSync(localOverridePath());
+    const second = loadConfig();
+    expect(second).not.toBe(first);
+    expect(second.presets["github-copilot"]!.heavy!.model).toBe("x/global");
+    expect(getConfigReloadError()).toBeNull();
+  });
+
+  it("a malformed project override created after startup is a failed reload, not a first load", () => {
+    // Startup without any project override...
+    const first = loadConfig();
+    expect(getConfigReloadError()).toBeNull();
+
+    // ...then a half-saved one appears. The source identity (HOME + project +
+    // state) is unchanged, so the previous config stays the valid fallback.
+    const p = localOverridePath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, "{ not json", "utf-8");
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(p, later, later);
+
+    expect(loadConfig()).toBe(first);
+    expect(getConfigReloadError()).toContain("opencode-model-router.overrides.jsonc");
+  });
+
+  it("localOverridePath resolves to <cwd>/.opencode/opencode-model-router.overrides.jsonc", () => {
+    expect(localOverridePath()).toBe(
+      join(process.cwd(), ".opencode", "opencode-model-router.overrides.jsonc"),
+    );
+  });
+
+  it("applies a project-local override", () => {
+    writeLocal({
+      presets: { anthropic: { fast: { model: "anthropic/project-fast" } } },
+    });
+    invalidateConfigCache();
+    expect(loadConfig().presets.anthropic!.fast!.model).toBe(
+      "anthropic/project-fast",
+    );
+  });
+
+  it("lets a project-local null grader temperature replace the bundled number", () => {
+    expect(loadConfig().enforcement?.verify?.graderTemperature).toBeTypeOf("number");
+
+    writeLocal({ enforcement: { verify: { graderTemperature: null } } });
+    invalidateConfigCache();
+
+    expect(loadConfig().enforcement?.verify?.graderTemperature).toBeNull();
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it("project-local wins over global for the same key", () => {
+    writeGlobal({
+      presets: { anthropic: { fast: { model: "anthropic/global-fast" } } },
+    });
+    writeLocal({
+      presets: { anthropic: { fast: { model: "anthropic/project-fast" } } },
+    });
+    invalidateConfigCache();
+    expect(loadConfig().presets.anthropic!.fast!.model).toBe(
+      "anthropic/project-fast",
+    );
+  });
+
+  it("merges distinct keys from both layers", () => {
+    writeGlobal({
+      presets: { anthropic: { fast: { model: "anthropic/global-fast" } } },
+    });
+    writeLocal({
+      presets: { anthropic: { heavy: { model: "anthropic/project-heavy" } } },
+    });
+    invalidateConfigCache();
+    const anthropic = loadConfig().presets.anthropic!;
+    expect(anthropic.fast!.model).toBe("anthropic/global-fast");
+    expect(anthropic.heavy!.model).toBe("anthropic/project-heavy");
+  });
+
+  it("a broken global file does not discard a valid project file", () => {
+    // global makes the merged config invalid; project is fine on its own
+    writeGlobal({ presets: { anthropic: { fast: { model: 123 } } } });
+    writeLocal({
+      presets: { anthropic: { medium: { model: "anthropic/project-medium" } } },
+    });
+    invalidateConfigCache();
+    const anthropic = loadConfig().presets.anthropic!;
+    expect(anthropic.medium!.model).toBe("anthropic/project-medium");
+    // fell back to the bundled fast model (global dropped)
+    expect(anthropic.fast!.model).toBe("anthropic/claude-haiku-5-5");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("combined overrides are invalid"),
+    );
+  });
+
+  it("a broken project file keeps the valid global file", () => {
+    writeGlobal({
+      presets: { anthropic: { fast: { model: "anthropic/global-fast" } } },
+    });
+    writeLocal({ presets: { anthropic: { fast: { model: 999 } } } });
+    invalidateConfigCache();
+    expect(loadConfig().presets.anthropic!.fast!.model).toBe(
+      "anthropic/global-fast",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findProjectOverride — upward search from cwd, bounded by the project root.
+// ---------------------------------------------------------------------------
+
+describe("findProjectOverride — upward search", () => {
+  let tmpRoot: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let savedCwd: string;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    savedCwd = process.cwd();
+    tmpRoot = join(
+      tmpdir(),
+      `oc-mr-walk-${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`,
+    );
+    mkdirSync(tmpRoot, { recursive: true });
+    // Isolate the global layer to an empty home so only the project file matters.
+    process.env.HOME = tmpRoot;
+    process.env.USERPROFILE = tmpRoot;
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    process.chdir(savedCwd);
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    try {
+      rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } catch {
+      // best-effort cleanup
+    }
+    invalidateConfigCache();
+  });
+
+  function write(path: string, obj: unknown): void {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(obj), "utf-8");
+  }
+
+  it("finds the project file from a nested subdirectory", () => {
+    const project = join(tmpRoot, "repo");
+    const file = join(project, ".opencode", "opencode-model-router.overrides.jsonc");
+    write(file, { defaultTier: "fast" });
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const deep = join(project, "src", "feature", "deep");
+    mkdirSync(deep, { recursive: true });
+
+    process.chdir(deep);
+    expect(findProjectOverride()).toBe(realpathSync(file));
+  });
+
+  it("does not escape the project root (stops at .git)", () => {
+    // An override above the repo root must NOT be picked up.
+    write(join(tmpRoot, ".opencode", "opencode-model-router.overrides.jsonc"), {
+      defaultTier: "heavy",
+    });
+    const project = join(tmpRoot, "repo");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const sub = join(project, "sub");
+    mkdirSync(sub, { recursive: true });
+
+    process.chdir(sub);
+    expect(findProjectOverride()).toBeUndefined();
+  });
+
+  it("loadConfig applies the project override when launched from a subdir", () => {
+    const project = join(tmpRoot, "repo");
+    write(join(project, ".opencode", "opencode-model-router.overrides.jsonc"), {
+      presets: { anthropic: { fast: { model: "anthropic/from-subdir" } } },
+    });
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const deep = join(project, "a", "b");
+    mkdirSync(deep, { recursive: true });
+
+    process.chdir(deep);
+    invalidateConfigCache();
+    expect(loadConfig().presets.anthropic!.fast!.model).toBe(
+      "anthropic/from-subdir",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Host-provided project directory (GitHub #70). OpenCode v2 runs one plugin
+// instance per project directory inside a single server process and chdirs that
+// process to $HOME, so the project override must be resolved from the directory
+// the host hands the plugin, with a config cache that is kept per directory.
+// ---------------------------------------------------------------------------
+
+describe("loadConfig — host-provided project directory", () => {
+  const FILE = "opencode-model-router.overrides.jsonc";
+  let tmpRoot: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let savedCwd: string;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let bump = 0;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    savedCwd = process.cwd();
+    tmpRoot = join(
+      tmpdir(),
+      `oc-mr-dir-${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`,
+    );
+    mkdirSync(tmpRoot, { recursive: true });
+    // $HOME is the temp root and the process cwd is $HOME, exactly like the
+    // OpenCode v2 server after process.chdir(home).
+    process.env.HOME = tmpRoot;
+    process.env.USERPROFILE = tmpRoot;
+    process.chdir(tmpRoot);
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    process.chdir(savedCwd);
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    try {
+      rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } catch {
+      // best-effort cleanup
+    }
+    invalidateConfigCache();
+  });
+
+  const fastModel = (dir: string): string | undefined =>
+    loadConfig(dir).presets.anthropic!.fast!.model;
+
+  const overrideFor = (model: string): string =>
+    JSON.stringify({ presets: { anthropic: { fast: { model } } } });
+
+  /** A repo-rooted project directory carrying its own override file. */
+  function makeProject(name: string, model: string): string {
+    const project = join(tmpRoot, name);
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(join(project, ".opencode"), { recursive: true });
+    writeFileSync(join(project, ".opencode", FILE), overrideFor(model), "utf-8");
+    return project;
+  }
+
+  /** Rewrite an override in place and move its mtime forward. */
+  function rewrite(file: string, content: string): void {
+    writeFileSync(file, content, "utf-8");
+    bump += 60_000;
+    const later = new Date(Date.now() + bump);
+    utimesSync(file, later, later);
+  }
+
+  it("finds the project override via loadConfig(dir) while process.cwd() is $HOME", () => {
+    const project = makeProject("repo", "anthropic/from-dir");
+    const file = join(project, ".opencode", FILE);
+
+    // The v2 server's view: cwd is $HOME, which has no project file.
+    expect(findProjectOverride()).toBeUndefined();
+    expect(fastModel(tmpRoot)).not.toBe("anthropic/from-dir");
+
+    expect(findProjectOverride(project)).toBe(realpathSync(file));
+    expect(fastModel(project)).toBe("anthropic/from-dir");
+    // Omitting the dir keeps today's cwd semantics.
+    expect(loadConfig().presets.anthropic!.fast!.model).not.toBe(
+      "anthropic/from-dir",
+    );
+  });
+
+  it("localOverridePath(dir) points into the given directory", () => {
+    const project = join(tmpRoot, "elsewhere");
+    expect(localOverridePath(project)).toBe(join(project, ".opencode", FILE));
+    expect(localOverridePath()).toBe(join(process.cwd(), ".opencode", FILE));
+  });
+
+  it("findProjectOverride(dir) walks upward from a nested subdirectory", () => {
+    const project = makeProject("repo", "anthropic/from-nested");
+    const deep = join(project, "src", "feature", "deep");
+    mkdirSync(deep, { recursive: true });
+
+    expect(findProjectOverride(deep)).toBe(
+      realpathSync(join(project, ".opencode", FILE)),
+    );
+    expect(fastModel(deep)).toBe("anthropic/from-nested");
+  });
+
+  it("findProjectOverride(dir) honours the repo-root and $HOME boundaries", () => {
+    // An override above the repo root must not be adopted.
+    mkdirSync(join(tmpRoot, ".opencode"), { recursive: true });
+    writeFileSync(join(tmpRoot, ".opencode", FILE), overrideFor("anthropic/above"), "utf-8");
+    const project = join(tmpRoot, "repo");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const sub = join(project, "sub");
+    mkdirSync(sub, { recursive: true });
+    expect(findProjectOverride(sub)).toBeUndefined();
+
+    // $HOME itself is not a project directory (no repo marker).
+    expect(findProjectOverride(tmpRoot)).toBeUndefined();
+  });
+
+  it("serves different configs for different project dirs, with stable identity per dir", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+    expect(a1.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+    expect(b1.presets.anthropic!.fast!.model).toBe("anthropic/proj-b-fast");
+    expect(a1).not.toBe(b1);
+
+    // Interleaved reads never evict or share the other directory's cache.
+    expect(loadConfig(projectA)).toBe(a1);
+    expect(loadConfig(projectB)).toBe(b1);
+    expect(loadConfig(projectA)).toBe(a1);
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("treats the same directory spelled differently as one cache entry", () => {
+    const project = makeProject("repo", "anthropic/one-entry");
+    const first = loadConfig(project);
+    expect(loadConfig(join(project, "src", ".."))).toBe(first);
+    expect(loadConfig(`${project}/`)).toBe(first);
+  });
+
+  it("hot-reloading one dir's override leaves the other dir's cached config untouched", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    rewrite(join(projectA, ".opencode", FILE), overrideFor("anthropic/proj-a-v2"));
+
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-v2");
+    expect(loadConfig(projectB)).toBe(b1);
+    expect(b1.presets.anthropic!.fast!.model).toBe("anthropic/proj-b-fast");
+    expect(loadConfig(projectA)).toBe(a2);
+  });
+
+  it("keeps last-good config and the reload error per directory", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const fileA = join(projectA, ".opencode", FILE);
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    rewrite(fileA, '{ "presets": { "anthropic": { "fast": { "model": ');
+
+    expect(loadConfig(projectA)).toBe(a1);
+    expect(getConfigReloadError(projectA)).toContain(findProjectOverride(projectA)!);
+    expect(getConfigReloadError(projectA)).toContain("invalid JSONC");
+    // The sibling directory and the cwd-keyed entry see no failure.
+    expect(loadConfig(projectB)).toBe(b1);
+    expect(getConfigReloadError(projectB)).toBeNull();
+    expect(getConfigReloadError()).toBeNull();
+
+    rewrite(fileA, overrideFor("anthropic/proj-a-fixed"));
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fixed");
+    expect(getConfigReloadError(projectA)).toBeNull();
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("treats a malformed project override created after startup as a failed reload for that directory", () => {
+    // Project loaded with no override file at all.
+    const project = join(tmpRoot, "proj-late");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const first = loadConfig(project);
+    expect(getConfigReloadError(project)).toBeNull();
+
+    // A half-saved override then appears. The source identity (HOME + project
+    // dir + state path) is unchanged, so `first` stays the valid fallback.
+    mkdirSync(join(project, ".opencode"), { recursive: true });
+    const file = join(project, ".opencode", FILE);
+    rewrite(file, '{ "presets": { "anthropic": { "fast": { "model": ');
+
+    expect(loadConfig(project)).toBe(first);
+    expect(getConfigReloadError(project)).toContain(findProjectOverride(project)!);
+    expect(getConfigReloadError(project)).toContain("invalid JSONC");
+    expect(getConfigReloadError()).toBeNull();
+  });
+
+  it("keeps last-good config per directory when a project override becomes unreachable (EACCES), then recovers", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const fileA = findProjectOverride(projectA)!;
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    try {
+      fsMock.unstatablePath = fileA;
+      // Not a removal: the unreachable candidate still ends the walk instead of
+      // vanishing, and the failure is recorded against this directory only.
+      expect(findProjectOverride(projectA)).toBe(fileA);
+      expect(loadConfig(projectA)).toBe(a1);
+      expect(a1.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+      expect(getConfigReloadError(projectA)).toContain(fileA);
+      expect(getConfigReloadError(projectA)).toContain("EACCES");
+      // The sibling directory and the cwd-keyed entry are unaffected.
+      expect(loadConfig(projectB)).toBe(b1);
+      expect(getConfigReloadError(projectB)).toBeNull();
+      expect(getConfigReloadError()).toBeNull();
+    } finally {
+      fsMock.unstatablePath = null;
+    }
+
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+    expect(getConfigReloadError(projectA)).toBeNull();
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("applies the lower-priority config, without an error, when one directory's override is removed (ENOENT)", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    rmSync(join(projectA, ".opencode", FILE));
+
+    const a2 = loadConfig(projectA);
+    expect(a2).not.toBe(a1);
+    expect(a2.presets.anthropic!.fast!.model).not.toBe("anthropic/proj-a-fast");
+    expect(getConfigReloadError(projectA)).toBeNull();
+    expect(loadConfig(projectB)).toBe(b1);
+  });
+
+  it("invalidateConfigCache() marks every directory stale", () => {
+    const projectA = makeProject("proj-a", "anthropic/proj-a-fast");
+    const projectB = makeProject("proj-b", "anthropic/proj-b-fast");
+    const a1 = loadConfig(projectA);
+    const b1 = loadConfig(projectB);
+
+    invalidateConfigCache();
+
+    const a2 = loadConfig(projectA);
+    const b2 = loadConfig(projectB);
+    expect(a2).not.toBe(a1);
+    expect(b2).not.toBe(b1);
+    expect(a2.presets.anthropic!.fast!.model).toBe("anthropic/proj-a-fast");
+    expect(b2.presets.anthropic!.fast!.model).toBe("anthropic/proj-b-fast");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findProjectOverride — walk boundaries. Without a repo marker the walk used to
+// run to the filesystem root and silently adopt an unrelated ancestor's file.
+// HOME is deliberately parked on a SIBLING directory here so these tests pin the
+// depth ceiling and the marker set, not the home-directory boundary.
+// ---------------------------------------------------------------------------
+
+describe("findProjectOverride — walk boundaries", () => {
+  const OVERRIDES = "opencode-model-router.overrides.jsonc";
+  let tmpRoot: string;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let savedCwd: string;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    savedCwd = process.cwd();
+    tmpRoot = join(
+      tmpdir(),
+      `oc-mr-bound-${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}`,
+    );
+    // Sibling of the walk tree, so homedir() is never an ancestor of cwd.
+    const fakeHome = join(tmpRoot, "h");
+    mkdirSync(fakeHome, { recursive: true });
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;
+    invalidateConfigCache();
+  });
+
+  afterEach(() => {
+    process.chdir(savedCwd);
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    try {
+      rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } catch {
+      // best-effort cleanup
+    }
+    invalidateConfigCache();
+  });
+
+  function write(path: string, obj: unknown): void {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(obj), "utf-8");
+  }
+
+  /** Build `levels` nested single-char dirs under `from`, returning the deepest. */
+  function nest(from: string, levels: number): string {
+    let dir = from;
+    for (let i = 0; i < levels; i++) dir = join(dir, "d");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  it("stops at the depth ceiling when no repo marker exists anywhere", () => {
+    const base = join(tmpRoot, "t");
+    // Override sits at the top; cwd is far deeper than the 16-level ceiling.
+    write(join(base, ".opencode", OVERRIDES), { defaultTier: "heavy" });
+    const deep = nest(base, 20);
+
+    process.chdir(deep);
+    expect(findProjectOverride()).toBeUndefined();
+  });
+
+  it("still finds a markerless project within the depth ceiling", () => {
+    const base = join(tmpRoot, "t");
+    const file = join(base, ".opencode", OVERRIDES);
+    write(file, { defaultTier: "fast" });
+    const deep = nest(base, 3);
+
+    process.chdir(deep);
+    expect(findProjectOverride()).toBe(realpathSync(file));
+  });
+
+  it("treats .hg as a repo root marker", () => {
+    write(join(tmpRoot, "t", ".opencode", OVERRIDES), { defaultTier: "heavy" });
+    const repo = join(tmpRoot, "t", "repo");
+    mkdirSync(join(repo, ".hg"), { recursive: true });
+    const sub = join(repo, "sub");
+    mkdirSync(sub, { recursive: true });
+
+    process.chdir(sub);
+    expect(findProjectOverride()).toBeUndefined();
+  });
+
+  it("treats .svn as a repo root marker", () => {
+    write(join(tmpRoot, "t", ".opencode", OVERRIDES), { defaultTier: "heavy" });
+    const repo = join(tmpRoot, "t", "repo");
+    mkdirSync(join(repo, ".svn"), { recursive: true });
+    const sub = join(repo, "sub");
+    mkdirSync(sub, { recursive: true });
+
+    process.chdir(sub);
+    expect(findProjectOverride()).toBeUndefined();
+  });
+
+  it("does NOT treat package.json as a marker (monorepo packages keep walking)", () => {
+    const repo = join(tmpRoot, "repo");
+    const file = join(repo, ".opencode", OVERRIDES);
+    write(file, { defaultTier: "fast" });
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    // A nested workspace package with its own manifest must not stop the walk.
+    const pkg = join(repo, "packages", "app");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), '{"name":"app"}', "utf-8");
+
+    process.chdir(pkg);
+    expect(findProjectOverride()).toBe(realpathSync(file));
+  });
+
+  // The guard above compares cwd() against homedir(). cwd() returns a realpath
+  // and homedir() returns $HOME verbatim, so when $HOME is reached through a
+  // symlink the two never match and the boundary stops applying. The link is
+  // faked at the fs boundary rather than created on disk: symlinkSync needs
+  // elevated privileges on Windows, so a real one would assert nothing there.
+  it("never adopts ~/.opencode when $HOME is reached through a symlink", () => {
+    const realHome = join(tmpRoot, "real-home");
+    write(join(realHome, ".opencode", OVERRIDES), { defaultTier: "heavy" });
+    const linkedHome = join(tmpRoot, "linked-home");
+
+    // $HOME is the link; it resolves to the same directory cwd() sits under.
+    fsMock.realpaths.set(linkedHome, realpathSync(realHome));
+    process.env.HOME = linkedHome;
+    process.env.USERPROFILE = linkedHome;
+    const scratch = join(realHome, "scratch");
+    mkdirSync(scratch, { recursive: true });
+
+    process.chdir(scratch);
+    try {
+      expect(findProjectOverride()).toBeUndefined();
+    } finally {
+      fsMock.realpaths.clear();
+    }
+  });
+
+  it("never adopts ~/.opencode from an unrelated directory below home", () => {
+    // The original escape: a scratch dir under $HOME with no repo marker.
+    const home = join(tmpRoot, "home2");
+    write(join(home, ".opencode", OVERRIDES), { defaultTier: "heavy" });
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const scratch = join(home, "scratch");
+    mkdirSync(scratch, { recursive: true });
+
+    process.chdir(scratch);
+    expect(findProjectOverride()).toBeUndefined();
+  });
+
+  it("still honours a home directory that is itself a repo root (dotfiles)", () => {
+    const home = join(tmpRoot, "home3");
+    const file = join(home, ".opencode", OVERRIDES);
+    write(file, { defaultTier: "fast" });
+    mkdirSync(join(home, ".git"), { recursive: true });
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const sub = join(home, "sub");
+    mkdirSync(sub, { recursive: true });
+
+    process.chdir(sub);
+    expect(findProjectOverride()).toBe(realpathSync(file));
+  });
+});

@@ -1,0 +1,1080 @@
+// ---------------------------------------------------------------------------
+// Persistence (M3): atomic outcomes.json, rotating decisions.jsonl, coalescing flusher (D15, A3).
+//
+// Design: docs/qa/cost-aware-routing/phase-1.3.md "Design (1.3.1)" §5.
+// The only module of src/routing/outcomes/ that touches disk, and only through the injected PersistFs.
+// The clock, the sleep function and the timers are injected too. It never opens, lists for processing,
+// renames or deletes a `*.scorecard.log` file (it filters readdir by its own names).
+// Runnable under Node type stripping (type-only imports use `import type`).
+// ---------------------------------------------------------------------------
+
+import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
+import { isAbsolute, join, normalize, resolve } from "node:path";
+import type {
+  DecisionRow,
+  DecisionTrace,
+  FlusherDeps,
+  ForeignCheck,
+  FlusherOptions,
+  FlushScheduler,
+  LoadResult,
+  LoadStatus,
+  LogRow,
+  OutcomeFlusher,
+  OutcomeLogger,
+  OutcomeKey,
+  OutcomeSnapshot,
+  OutcomeStore,
+  OutcomesFile,
+  PersistDeps,
+  PersistFs,
+  PersistStat,
+  Persister,
+  PersisterOptions,
+  ReadRowsResult,
+  RefusalRow,
+  RouteChoice,
+  SignalKind,
+  VerdictRow,
+  WriteResult,
+} from "./types";
+import {
+  DECISIONS_FILE,
+  DECISIONS_MAX_BYTES,
+  DECISIONS_MAX_GENERATIONS,
+  DECISIONS_ROTATED_RE,
+  DEFAULT_OUTCOMES_DIRNAME,
+  FLUSH_BATCH_ROWS,
+  FLUSH_MIN_INTERVAL_MS,
+  LADDER_STEP_KINDS,
+  LOG_ROW_VERSION,
+  SIGNAL_KINDS,
+  MAX_QUEUED_ROWS,
+  MAX_CORRUPT_COPIES,
+  NEED_TERM_RE,
+  OUTCOMES_CORRUPT_PREFIX,
+  OUTCOMES_CORRUPT_RE,
+  OUTCOMES_FILE,
+  OUTCOMES_SCHEMA_ID,
+  OUTCOMES_SCHEMA_VERSION,
+  OUTCOMES_TMP_PREFIX,
+  RENAME_RETRY_DELAYS_MS,
+  STALE_TMP_MS,
+  parseKey,
+  safeNow,
+} from "./types";
+import { parseSnapshot } from "./store";
+import { withLock } from "../file-lock";
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+type Rec = Record<string, unknown>;
+
+function isRec(x: unknown): x is Rec {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+function isFiniteNum(x: unknown): x is number {
+  return typeof x === "number" && Number.isFinite(x);
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function failure(error: unknown): WriteResult {
+  const code = errorCode(error);
+  return { ok: false, error: describeError(error), ...(code !== undefined ? { code } : {}) };
+}
+
+function emptySnapshot(): OutcomeSnapshot {
+  return { version: OUTCOMES_SCHEMA_VERSION, entries: {} };
+}
+
+// ---------------------------------------------------------------------------
+// Directory resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * `routing.outcomes.path` is a **directory** holding both files. Unset or blank → the scorecard
+ * directory (`<tmpdir>/opencode-model-router-trajectory`). A leading `~` resolves against `homedir`, an
+ * absolute path is normalised, and a relative path resolves against the default directory (never the
+ * process cwd).
+ */
+export function resolveOutcomesDir(
+  configured: string | null | undefined,
+  env: { readonly tmpdir: string; readonly homedir: string },
+): string {
+  const fallback = join(env.tmpdir, DEFAULT_OUTCOMES_DIRNAME);
+  const raw = typeof configured === "string" ? configured.trim() : "";
+  if (raw === "") return fallback;
+  if (raw === "~") return normalize(env.homedir);
+  if (raw.startsWith("~/") || raw.startsWith("~\\")) return join(env.homedir, raw.slice(2));
+  if (isAbsolute(raw)) return normalize(raw);
+  return join(fallback, raw);
+}
+
+// ---------------------------------------------------------------------------
+// Node implementations of the injected dependencies
+// ---------------------------------------------------------------------------
+
+export function nodePersistFs(): PersistFs {
+  return {
+    async createExclusive(path, data) {
+      let handle;
+      try { handle = await open(path, "wx"); } catch (error) {
+        if (errorCode(error) === "EEXIST") return false;
+        throw error;
+      }
+      try { await handle.writeFile(data, "utf8"); } finally { await handle.close(); }
+      return true;
+    },
+    async mkdirp(dir: string): Promise<void> {
+      await mkdir(dir, { recursive: true });
+    },
+    async readText(path: string): Promise<string | null> {
+      try {
+        return await readFile(path, "utf8");
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return null;
+        throw error;
+      }
+    },
+    async writeDurable(path: string, data: string): Promise<void> {
+      const handle = await open(path, "w");
+      try {
+        await handle.writeFile(data, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    },
+    async appendText(path: string, data: string): Promise<void> {
+      await appendFile(path, data, "utf8");
+    },
+    async rename(from: string, to: string): Promise<void> {
+      await rename(from, to);
+    },
+    async unlink(path: string): Promise<void> {
+      try {
+        await unlink(path);
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+      }
+    },
+    async stat(path: string): Promise<(PersistStat & { readonly mode: number }) | null> {
+      try {
+        const s = await stat(path);
+        return { size: s.size, mtimeMs: s.mtimeMs, mode: s.mode };
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return null;
+        throw error;
+      }
+    },
+    async readdir(dir: string): Promise<string[]> {
+      try {
+        return await readdir(dir);
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return [];
+        throw error;
+      }
+    },
+  };
+}
+
+/** `setTimeout` with `.unref()`: a pending flush never keeps the process alive. */
+export function nodeScheduler(): FlushScheduler {
+  return {
+    setTimer(fn: () => void, ms: number): unknown {
+      const handle = setTimeout(fn, ms);
+      handle.unref();
+      return handle;
+    },
+    clearTimer(handle: unknown): void {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    },
+  };
+}
+
+export function nodePersistDeps(logger: OutcomeLogger): PersistDeps {
+  return {
+    fs: nodePersistFs(),
+    now: Date.now,
+    sleep: (ms: number) => new Promise<void>((done) => setTimeout(done, ms)),
+    logger,
+    pid: process.pid,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Windows-safe rename
+// ---------------------------------------------------------------------------
+
+const RETRYABLE_CODES: ReadonlySet<string> = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+async function withRetry<T>(
+  operation: () => Promise<T>,
+  sleep: (ms: number) => Promise<void>,
+  delays: readonly number[],
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === undefined || !RETRYABLE_CODES.has(code) || attempt >= delays.length) throw error;
+      await sleep(delays[attempt] as number);
+    }
+  }
+}
+
+/**
+ * `rename` that survives Windows sharing violations: `EPERM`/`EBUSY`/`EACCES` (the target or source is
+ * held open by an antivirus, an indexer, a reader or another instance) are retried after each delay of
+ * `delays`; any other code, or exhausted retries, is thrown. Always off the hot path.
+ */
+export async function renameWithRetry(
+  fs: Pick<PersistFs, "rename">,
+  from: string,
+  to: string,
+  sleep: (ms: number) => Promise<void>,
+  delays: readonly number[] = RENAME_RETRY_DELAYS_MS,
+): Promise<void> {
+  await withRetry(() => fs.rename(from, to), sleep, delays);
+}
+
+// ---------------------------------------------------------------------------
+// Decision-log rows
+// ---------------------------------------------------------------------------
+
+const LOGGED_MODES: readonly string[] = ["shadow", "advise", "enforce"];
+const COST_UNITS: readonly string[] = ["usd", "ratio"];
+const VERDICT_VALUES: readonly string[] = ["pass", "fail", "unverifiable"];
+
+const BINDINGS: readonly string[] = ["exact", "intersection", "unknown"];
+
+function isStringArray(x: unknown): x is string[] {
+  return Array.isArray(x) && x.every((v): v is string => typeof v === "string");
+}
+
+function isOutcomeKey(x: unknown): x is OutcomeKey {
+  return typeof x === "string" && parseKey(x) !== null;
+}
+
+function oneOf(list: readonly string[], x: unknown): x is string {
+  return typeof x === "string" && list.includes(x);
+}
+
+function readChoice(x: unknown): RouteChoice | null {
+  if (!isRec(x)) return null;
+  const { key, agent, origin, model, variant } = x;
+  if (!isOutcomeKey(key) || typeof agent !== "string" || typeof model !== "string" || typeof variant !== "string") return null;
+  if (origin !== "router" && origin !== "host" && origin !== "role") return null;
+  return { key, agent, origin, model, variant };
+}
+
+/** A trace is optional and cosmetic: a malformed one is dropped, never a reason to lose the row. */
+function readTrace(x: unknown): DecisionTrace | undefined {
+  if (!isRec(x) || !isRec(x.routeLines)) return undefined;
+  const { count, conflict, edgeOnly } = x.routeLines;
+  if (!isFiniteNum(count) || typeof conflict !== "boolean" || typeof edgeOnly !== "boolean") return undefined;
+  let backend: DecisionTrace["backend"] = null;
+  if (x.backend !== null && x.backend !== undefined) {
+    const b = x.backend;
+    if (!isRec(b) || typeof b.id !== "string" || typeof b.status !== "string" || !isFiniteNum(b.latencyMs)) return undefined;
+    backend = {
+      id: b.id,
+      status: b.status,
+      latencyMs: b.latencyMs,
+      ...(typeof b.label === "string" ? { label: b.label } : {}),
+      ...(b.rejected === true ? { rejected: true as const } : {}),
+      ...(b.disagrees === true ? { disagrees: true as const } : {}),
+    };
+  }
+  const argmin = readChoice(x.argmin);
+  return {
+    routeLines: { count, conflict, edgeOnly },
+    backend,
+    ...(x.backendSkipped === "credentials" ? { backendSkipped: "credentials" as const } : {}),
+    ...(argmin === null ? {} : { argmin }),
+    // QA-G-B-2-2 (D14): only well-shaped need terms; one that could carry prompt text (an older row's URL or path) is dropped.
+    ...(isStringArray(x.needTerms) ? { needTerms: x.needTerms.filter((term) => NEED_TERM_RE.test(term)) } : {}),
+  };
+}
+function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {
+  return LADDER_STEP_KINDS.find((kind) => kind === x) ?? null;
+}
+
+/**
+ * Validate one JSONL line. A valid row comes back as a clean copy (unknown extra fields are ignored,
+ * forward-compatible within v1; non-finite `costs` entries are dropped); anything else is `null`.
+ */
+export function parseLogLine(line: string): LogRow | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRec(json) || json.v !== LOG_ROW_VERSION) return null;
+  const { kind, ts, sessionID } = json;
+  if (typeof ts !== "string" || !Number.isFinite(Date.parse(ts)) || typeof sessionID !== "string") return null;
+  const step = readLadderStep(json.step);
+  if (step === null) return null;
+
+  if (kind === "verdict" || kind === "refusal") {
+    const { decisionID, childSessionID, attemptID, key } = json;
+    if (decisionID !== null && typeof decisionID !== "string") return null;
+    if (typeof childSessionID !== "string" || typeof attemptID !== "string" || !isOutcomeKey(key)) return null;
+    if (kind === "refusal") {
+      const row: RefusalRow = {
+        v: LOG_ROW_VERSION, kind, ts, sessionID, decisionID, childSessionID, attemptID, key, step,
+        ...(json.overrides === "pass" ? { overrides: "pass" as const } : {}),
+      };
+      return row;
+    }
+    const verdict = json.verdict;
+    if (!oneOf(VERDICT_VALUES, verdict)) return null;
+    const row: VerdictRow = {
+      v: LOG_ROW_VERSION,
+      kind,
+      ts,
+      sessionID,
+      decisionID,
+      childSessionID,
+      attemptID,
+      key,
+      verdict: verdict as VerdictRow["verdict"],
+      step,
+    };
+    return row;
+  }
+
+  if (kind !== "decision") return null;
+  const { decisionID, mode, childSessionID, facts, switched, pinned, unit, costs, confidence, reason, resume } = json;
+  if (typeof decisionID !== "string" || !oneOf(LOGGED_MODES, mode) || !oneOf(COST_UNITS, unit)) return null;
+  if (childSessionID !== null && typeof childSessionID !== "string") return null;
+  if (typeof switched !== "boolean" || typeof pinned !== "boolean" || typeof resume !== "boolean") return null;
+  if (!isFiniteNum(confidence) || typeof reason !== "string") return null;
+
+  if (!isRec(facts)) return null;
+  const { class: cls, risk, scope, needs, confidence: factsConfidence, source } = facts;
+  if (typeof cls !== "string" || typeof risk !== "string" || typeof scope !== "string" || typeof source !== "string") return null;
+  if (!Array.isArray(needs) || !needs.every((n): n is string => typeof n === "string")) return null;
+  if (!isFiniteNum(factsConfidence)) return null;
+
+  const chosen = readChoice(json.chosen);
+  if (chosen === null) return null;
+  const best = json.best === null ? null : readChoice(json.best);
+  if (json.best !== null && best === null) return null;
+
+  if (!isRec(costs)) return null;
+  const cleanCosts: Record<string, number> = Object.fromEntries(
+    Object.entries(costs).filter((entry): entry is [string, number] => isFiniteNum(entry[1])),
+  );
+
+  const trace = readTrace(json.trace);
+  const isDetection = (value: unknown): value is "none" | "grader" | "deterministic" =>
+    value === "none" || value === "grader" || value === "deterministic";
+  const detection = isRec(json.detection) && isDetection(json.detection.effective)
+    ? { effective: json.detection.effective, ...(isDetection(json.detection.claimed) ? { claimed: json.detection.claimed } : {}) }
+    : undefined;
+  const capability = isRec(json.capability)
+    && (json.capability.pick === null || isFiniteNum(json.capability.pick))
+    && (json.capability.dispatched === null || isFiniteNum(json.capability.dispatched))
+    ? { pick: json.capability.pick, dispatched: json.capability.dispatched }
+    : undefined;
+  const row: DecisionRow = {
+    v: LOG_ROW_VERSION,
+    kind,
+    ts,
+    sessionID,
+    decisionID,
+    mode: mode as DecisionRow["mode"],
+    childSessionID,
+    facts: { class: cls, risk, scope, needs: [...needs], confidence: factsConfidence, source },
+    chosen,
+    best,
+    switched,
+    pinned,
+    unit: unit as DecisionRow["unit"],
+    costs: cleanCosts,
+    confidence,
+    reason,
+    step,
+    resume,
+    ...(trace === undefined ? {} : { trace }),
+    ...(detection === undefined ? {} : { detection }),
+    ...(capability === undefined ? {} : { capability }),
+    ...(typeof json.role === "string" ? { role: json.role } : {}),
+    ...(isStringArray(json.grant) ? { grant: [...json.grant] } : {}),
+    ...(isStringArray(json.boundsReasons) ? { boundsReasons: [...json.boundsReasons] } : {}),
+    ...(isFiniteNum(json.budgetUsed) ? { budgetUsed: json.budgetUsed } : {}),
+    ...(oneOf(SIGNAL_KINDS, json.signal) ? { signal: json.signal as SignalKind } : {}),
+    ...(typeof json.explore === "boolean" ? { explore: json.explore } : {}),
+    ...(isFiniteNum(json.propensity) ? { propensity: json.propensity } : {}),
+    ...(oneOf(BINDINGS, json.binding) ? { binding: json.binding as NonNullable<DecisionRow["binding"]> } : {}),
+    ...(typeof json.tier === "string" && json.tier !== "" ? { tier: json.tier } : {}),
+    ...(isFiniteNum(json.signalWeight) ? { signalWeight: json.signalWeight } : {}),
+    ...(typeof json.attemptID === "string" && json.attemptID !== "" ? { attemptID: json.attemptID } : {}),
+  };
+  return row;
+}
+
+/** `20261006T120000123Z` for the rotated generation names (`DECISIONS_ROTATED_RE`). */
+export function compactStamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:.]/g, "");
+}
+
+function stampToMs(stamp: string): number | null {
+  const m = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z$/.exec(stamp);
+  if (m === null) return null;
+  const [, y, mo, d, h, mi, s, ms] = m.map(Number) as [number, number, number, number, number, number, number, number];
+  return Date.UTC(y, mo - 1, d, h, mi, s, ms);
+}
+
+function rotatedNames(names: readonly string[]): string[] {
+  return names.filter((name) => DECISIONS_ROTATED_RE.test(name)).sort();
+}
+
+// ---------------------------------------------------------------------------
+// Persister
+// ---------------------------------------------------------------------------
+
+export function createPersister(dir: string, deps: PersistDeps, options: PersisterOptions = {}): Persister {
+  const { fs, sleep, logger, pid } = deps;
+  const now = (): number => safeNow(deps.now);
+  const outcomesPath = join(dir, OUTCOMES_FILE);
+  const decisionsPath = join(dir, DECISIONS_FILE);
+  const maxBytes = options.maxBytes ?? DECISIONS_MAX_BYTES;
+  const maxGenerations = Math.max(0, Math.floor(options.maxGenerations ?? DECISIONS_MAX_GENERATIONS));
+  const delays = options.renameRetryDelaysMs ?? RENAME_RETRY_DELAYS_MS;
+
+  let seq = 0;
+  /** Set when the file on disk must not be overwritten (newer schema, or unreadable). */
+  let readOnlyReason: string | null = null;
+  /** mtime of outcomes.json at the last load/save; `undefined` until the first load (no foreign-writer check). */
+  let lastKnownMtime: number | null | undefined;
+  let warnedForeignWriter = false;
+  let warnedMerge = false;
+  /** Size of decisions.jsonl right after this persister's last append (a file that ends with a newline); `null` = not appended yet. */
+  let knownEnd: number | null = null;
+  /** What this persister last loaded or wrote: the base for `disk − baseline` when another process writes (QA-1.3-4). */
+  let baseline: OutcomeSnapshot | undefined;
+
+  async function statOrNull(path: string): Promise<PersistStat | null> {
+    try {
+      return await fs.stat(path);
+    } catch (error) {
+      logger.info?.("[router] outcome store stat failed", { path, error: describeError(error) });
+      return null;
+    }
+  }
+
+  async function cleanStaleTemps(): Promise<void> {
+    try {
+      const t = now();
+      for (const name of await fs.readdir(dir)) {
+        if (!name.startsWith(OUTCOMES_TMP_PREFIX)) continue;
+        const path = join(dir, name);
+        try {
+          const st = await fs.stat(path);
+          if (st !== null && t - st.mtimeMs > STALE_TMP_MS) await fs.unlink(path);
+        } catch (error) {
+          logger.info?.("[router] stale outcome temp file not removed", { path, error: describeError(error) });
+        }
+      }
+    } catch (error) {
+      logger.info?.("[router] outcome temp cleanup skipped", { dir, error: describeError(error) });
+    }
+  }
+
+  function loadResult(
+    status: LoadStatus,
+    message: string | null,
+    snapshot: OutcomeSnapshot = emptySnapshot(),
+    dropped = 0,
+    savedAt: string | null = null,
+  ): LoadResult {
+    return { status, snapshot, dropped, savedAt, message };
+  }
+
+  async function loadInner(quarantine: boolean): Promise<LoadResult> {
+    readOnlyReason = null;
+    const absPath = resolve(outcomesPath);
+    let result: LoadResult;
+    let text: string | null;
+    try {
+      text = await withRetry(() => fs.readText(outcomesPath), sleep, delays);
+    } catch (error) {
+      // Something exists but cannot be read: never overwrite it blindly.
+      readOnlyReason = `outcome store at ${absPath} is unreadable`;
+      const reason = describeError(error);
+      logger.warn("[router] outcome store unreadable; persistence disabled for this process", { path: outcomesPath, reason });
+      return loadResult("corrupt", `${absPath}: cannot read (${reason})`);
+    }
+
+    if (text === null) {
+      result = loadResult("missing", null);
+    } else {
+      let json: unknown;
+      let parseError: string | null = null;
+      try {
+        json = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); // a UTF-8 BOM is tolerated
+      } catch (error) {
+        parseError = `invalid JSON: ${describeError(error)}`;
+      }
+      const parsed = parseError === null ? parseSnapshot(json) : null;
+
+      if (parsed !== null && parsed.ok) {
+        const savedAt = isRec(json) && typeof json.savedAt === "string" ? json.savedAt : null;
+        let message: string | null = null;
+        if (parsed.dropped > 0) {
+          message = `${absPath}: ${parsed.dropped} invalid ${parsed.dropped === 1 ? "entry" : "entries"} dropped`;
+          logger.warn("[router] outcome store had invalid entries; they were dropped", { path: outcomesPath, dropped: parsed.dropped });
+        }
+        result = loadResult("ok", message, parsed.snapshot, parsed.dropped, savedAt);
+      } else if (parsed !== null && parsed.reason === "unsupported-version") {
+        readOnlyReason = parsed.message.startsWith("unsupported outcome store version")
+          ? "unsupported outcome store version on disk"
+          : "unrecognized outcome store on disk";
+        logger.warn("[router] outcome store is not a version-1 file of this plugin; leaving it untouched", {
+          path: outcomesPath,
+          reason: parsed.message,
+        });
+        result = loadResult("unsupported-version", `${absPath}: ${parsed.message}`);
+      } else {
+        const reason = parseError ?? (parsed !== null && !parsed.ok ? parsed.message : "unknown error");
+        if (quarantine) await quarantineCorrupt();
+        logger.warn("[router] outcome store corrupted; starting fresh", { path: outcomesPath, reason });
+        result = loadResult("corrupt", `${absPath}: ${reason}`);
+      }
+    }
+
+    baseline = result.snapshot;
+    lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
+    if (quarantine) await cleanStaleTemps();
+    return result;
+  }
+
+  /** Move the unparseable/malformed store aside under a unique name and keep only the newest few copies. */
+  async function quarantineCorrupt(): Promise<void> {
+    try {
+      let ms = now();
+      const newest = (await fs.readdir(dir)).filter((name) => OUTCOMES_CORRUPT_RE.test(name)).sort().at(-1);
+      const newestMs = newest === undefined ? null : stampToMs((OUTCOMES_CORRUPT_RE.exec(newest) ?? [])[1] ?? "");
+      if (newestMs !== null && ms <= newestMs) ms = newestMs + 1; // strictly newer than every kept copy, so pruning drops the oldest
+      let moved = false;
+      for (let attempt = 0; attempt < 20 && !moved; attempt++) {
+        const target = join(dir, `${OUTCOMES_CORRUPT_PREFIX}${compactStamp(ms)}-${pid}.json`);
+        if ((await statOrNull(target)) === null) {
+          await renameWithRetry(fs, outcomesPath, target, sleep, delays);
+          moved = true;
+        } else {
+          ms += 1;
+        }
+      }
+      if (!moved) throw new Error("no free quarantine file name");
+      const copies = (await fs.readdir(dir)).filter((name) => OUTCOMES_CORRUPT_RE.test(name)).sort();
+      for (const name of copies.slice(0, Math.max(0, copies.length - MAX_CORRUPT_COPIES))) {
+        try {
+          await fs.unlink(join(dir, name));
+        } catch (error) {
+          logger.info?.("[router] old quarantined outcome store not removed", { name, error: describeError(error) });
+        }
+      }
+    } catch (error) {
+      logger.warn("[router] could not quarantine the corrupt outcome store; the next save overwrites it", {
+        path: outcomesPath,
+        error: describeError(error),
+      });
+    }
+  }
+
+  async function checkForeignWriter(): Promise<void> {
+    if (lastKnownMtime === undefined || warnedForeignWriter) return;
+    const current = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
+    if (current !== lastKnownMtime) {
+      warnedForeignWriter = true;
+      logger.warn("[router] another process wrote outcomes.json; the last writer wins", { path: outcomesPath });
+    }
+  }
+
+  async function rotate(): Promise<void> {
+    try {
+      let ms = now();
+      const newest = rotatedNames(await fs.readdir(dir)).at(-1);
+      const match = newest === undefined ? null : DECISIONS_ROTATED_RE.exec(newest);
+      const newestMs = match === null ? null : stampToMs(match[1] as string);
+      if (newestMs !== null && ms <= newestMs) ms = newestMs + 1; // names stay unique and chronological
+      const target = join(dir, `decisions.${compactStamp(ms)}-${pid}.jsonl`);
+      try {
+        // Another process may have rotated while we listed generations. Do not rotate its small new file.
+        const current = await fs.stat(decisionsPath);
+        if (current === null || current.size < maxBytes) return;
+        await renameWithRetry(fs, decisionsPath, target, sleep, delays);
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error; // ENOENT: another process rotated first
+      }
+      const generations = rotatedNames(await fs.readdir(dir));
+      for (const name of generations.slice(0, Math.max(0, generations.length - maxGenerations))) {
+        try {
+          await fs.unlink(join(dir, name));
+        } catch (error) {
+          logger.warn("[router] could not prune a rotated decision log", { name, error: describeError(error) });
+        }
+      }
+    } catch (error) {
+      logger.warn("[router] decision log rotation failed; appending to the live file", { error: describeError(error) });
+    }
+  }
+
+  return {
+    dir,
+    outcomesPath,
+    decisionsPath,
+
+    async withSnapshotLock(run): Promise<boolean> {
+      const result = await withLock(fs, dir, `${outcomesPath}.lock`, now, logger, run);
+      return result.status === "ran";
+    },
+
+    async load(opts?: { readonly quarantine?: boolean }): Promise<LoadResult> {
+      try {
+        return await loadInner(opts?.quarantine ?? true);
+      } catch (error) {
+        const reason = describeError(error);
+        readOnlyReason = `outcome store at ${resolve(outcomesPath)} failed to load`;
+        logger.warn("[router] outcome store failed to load; persistence disabled for this process", { path: outcomesPath, reason });
+        return loadResult("corrupt", `${resolve(outcomesPath)}: ${reason}`);
+      }
+    },
+
+    async saveSnapshot(snapshot: OutcomeSnapshot): Promise<WriteResult> {
+      if (readOnlyReason !== null) return { ok: false, error: readOnlyReason, readOnly: true };
+      const tmp = join(dir, `${OUTCOMES_TMP_PREFIX}${pid}-${++seq}`);
+      try {
+        await fs.mkdirp(dir);
+        await checkForeignWriter();
+        const file: OutcomesFile = {
+          schema: OUTCOMES_SCHEMA_ID,
+          version: OUTCOMES_SCHEMA_VERSION,
+          savedAt: new Date(now()).toISOString(),
+          entries: snapshot.entries,
+        };
+        await fs.writeDurable(tmp, JSON.stringify(file, null, 2) + "\n");
+        await renameWithRetry(fs, tmp, outcomesPath, sleep, delays);
+        baseline = snapshot;
+        lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
+        return { ok: true };
+      } catch (error) {
+        try {
+          await fs.unlink(tmp);
+        } catch (cleanupError) {
+          logger.info?.("[router] outcome temp file not removed", { tmp, error: describeError(cleanupError) });
+        }
+        // Exhausted Windows rename retries may mean a read-only target, not a transient sharing violation.
+        // Node stat exposes its mode; injected filesystems without that evidence remain retryable.
+        if (errorCode(error) === "EPERM") {
+          const target = await statOrNull(outcomesPath);
+          if (target !== null && "mode" in target && typeof target.mode === "number" && (target.mode & 0o222) === 0) {
+            readOnlyReason = `outcome store at ${resolve(outcomesPath)} is read-only (EPERM)`;
+            return { ok: false, code: "EPERM", error: readOnlyReason, readOnly: true };
+          }
+        }
+        return failure(error);
+      }
+    },
+
+    async appendRows(rows: readonly LogRow[]): Promise<WriteResult> {
+      if (rows.length === 0) return { ok: true };
+      try {
+        await fs.mkdirp(dir);
+        const body = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+        let size = (await statOrNull(decisionsPath))?.size ?? 0;
+        if (size > 0 && size + Buffer.byteLength(body, "utf8") + 1 > maxBytes) {
+          await rotate();
+          size = (await statOrNull(decisionsPath))?.size ?? 0;
+        }
+        // QA-1.3-9: a crash can leave a torn last line without its newline; a batch that follows one starts on a fresh
+        // line, so the next row is not glued to the fragment (readRows skips the torn line). QA-2.4-R2-10: only then. A file
+        // that ends with a newline (every batch of this process does) takes the batch as it is, with no blank line between
+        // batches. The end of the file is only looked at when it is not where this process' last append left it: its first
+        // batch, or another process wrote since.
+        let lead = "";
+        if (size > 0 && size !== knownEnd) {
+          try {
+            const existing = await fs.readText(decisionsPath);
+            if (existing !== null && !existing.endsWith("\n")) lead = "\n";
+          } catch (readError) {
+            lead = "\n"; // cannot tell: a blank line is harmless, a glued row is not
+            logger.info?.("[router] decisions log end not checked", { error: describeError(readError) });
+          }
+        }
+        await fs.appendText(decisionsPath, lead + body);
+        knownEnd = size + Buffer.byteLength(lead + body, "utf8");
+        return { ok: true };
+      } catch (error) {
+        return failure(error);
+      }
+    },
+
+    async readForeignWrites(force = false): Promise<ForeignCheck> {
+      try {
+        if (readOnlyReason !== null || lastKnownMtime === undefined) return { status: "unchanged" };
+        // Strict stat/read: a failure here is "we do not know what is on disk", never "nothing changed".
+        const st = await fs.stat(outcomesPath);
+        const current = st?.mtimeMs ?? null;
+        if (!force && current === lastKnownMtime) return { status: "unchanged" };
+        if (current === null) {
+          lastKnownMtime = null; // removed: the next save recreates it (its entries are then a new lineage, QA-1.3-16)
+          return { status: "unchanged" };
+        }
+        const text = await withRetry(() => fs.readText(outcomesPath), sleep, delays);
+        if (text === null) {
+          lastKnownMtime = null; // vanished between the stat and the read
+          return { status: "unchanged" };
+        }
+        let json: unknown;
+        let unparseable: string | null = null;
+        try {
+          json = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+        } catch (error) {
+          unparseable = `invalid JSON: ${describeError(error)}`;
+        }
+        const parsed = unparseable === null ? parseSnapshot(json) : null;
+        if (parsed !== null && parsed.ok) {
+          // Filesystems can give two distinct writes the same mtime. Under the lock compare content too.
+          if (current === lastKnownMtime && JSON.stringify(parsed.snapshot) === JSON.stringify(baseline)) {
+            return { status: "unchanged" };
+          }
+          // Only a successfully parsed file counts as "seen" (QA-1.3-18): the mtime is recorded here, not before.
+          const previous = baseline ?? emptySnapshot();
+          baseline = parsed.snapshot;
+          lastKnownMtime = current;
+          if (warnedMerge) {
+            logger.info?.("[router] merged another process's outcome changes", { path: outcomesPath });
+          } else {
+            warnedMerge = true;
+            logger.warn("[router] another process writes this outcome directory; its changes are merged into this process's before each save", {
+              path: outcomesPath,
+            });
+          }
+          return { status: "merge", disk: parsed.snapshot, baseline: previous };
+        }
+        if (parsed !== null && parsed.reason === "unsupported-version") {
+          readOnlyReason = parsed.message.startsWith("unsupported outcome store version")
+            ? "unsupported outcome store version on disk"
+            : "unrecognized outcome store on disk";
+          lastKnownMtime = current;
+          logger.warn("[router] another process replaced outcomes.json with a file this plugin does not own; not overwriting it", {
+            path: outcomesPath,
+            reason: parsed.message,
+          });
+          return { status: "unchanged" }; // the save that follows is refused as read-only
+        }
+        // Garbage or a malformed version-1 file: move it aside *before* the save replaces it.
+        logger.warn("[router] another process left an unreadable outcomes.json; it is moved aside and replaced", {
+          path: outcomesPath,
+          reason: unparseable ?? (parsed !== null && !parsed.ok ? parsed.message : "unknown"),
+        });
+        await quarantineCorrupt();
+        lastKnownMtime = (await statOrNull(outcomesPath))?.mtimeMs ?? null;
+        return { status: "unchanged" };
+      } catch (error) {
+        const reason = describeError(error);
+        logger.warn("[router] could not read outcomes.json to check for another writer; the snapshot save is skipped this round", {
+          path: outcomesPath,
+          error: reason,
+        });
+        return { status: "skip", reason: `cannot read ${resolve(outcomesPath)}: ${reason}` };
+      }
+    },
+    async readRows(): Promise<ReadRowsResult> {
+      const rows: LogRow[] = [];
+      const files: string[] = [];
+      let skipped = 0;
+      let generations = 0;
+      let names: string[] = [];
+      try {
+        names = await fs.readdir(dir);
+      } catch (error) {
+        logger.warn("[router] decision log directory unreadable", { dir, error: describeError(error) });
+        return { rows, skipped, files, oldestTs: null, generations: 0 };
+      }
+      for (const name of [...rotatedNames(names), DECISIONS_FILE]) {
+        const path = join(dir, name);
+        let text: string | null;
+        try {
+          text = await withRetry(() => fs.readText(path), sleep, delays);
+        } catch (error) {
+          logger.warn("[router] decision log unreadable; skipped", { path, error: describeError(error) });
+          continue;
+        }
+        if (text === null) continue;
+        files.push(path);
+        if (name !== DECISIONS_FILE) generations += 1;
+        for (const line of (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r?\n/)) {
+          if (line.trim() === "") continue;
+          const row = parseLogLine(line);
+          if (row === null) skipped += 1;
+          else rows.push(row);
+        }
+      }
+      let oldestTs: string | null = null;
+      let oldestMs = Number.POSITIVE_INFINITY;
+      for (const row of rows) {
+        const t = Date.parse(row.ts);
+        if (t < oldestMs) {
+          oldestMs = t;
+          oldestTs = row.ts;
+        }
+      }
+      return { rows, skipped, files, oldestTs, generations };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Flusher: coalescing, throttled, never on the hot path
+// ---------------------------------------------------------------------------
+
+export function createFlusher(
+  store: Pick<OutcomeStore, "revision" | "snapshot"> & Partial<Pick<OutcomeStore, "mergeForeign">>,
+  persister: Pick<Persister, "saveSnapshot" | "appendRows"> & Partial<Pick<Persister, "readForeignWrites" | "withSnapshotLock">>,
+  deps: FlusherDeps,
+  options: FlusherOptions = {},
+): OutcomeFlusher {
+  const { scheduler, logger } = deps;
+  const now = (): number => safeNow(deps.now);
+  const minIntervalMs = options.minIntervalMs ?? FLUSH_MIN_INTERVAL_MS;
+  const batchRows = Math.max(1, Math.floor(options.batchRows ?? FLUSH_BATCH_ROWS));
+  const maxQueuedRows = Math.max(1, Math.floor(options.maxQueuedRows ?? MAX_QUEUED_ROWS));
+
+  let queue: LogRow[] = [];
+  let writtenRevision = store.revision;
+  let inFlight: Promise<void> | null = null;
+  let timer: { handle: unknown } | null = null;
+  let lastFlushEnd = Number.NEGATIVE_INFINITY;
+  let disposed = false;
+  let disposing: Promise<void> | null = null;
+  let droppedRows = 0;
+  const failing = new Set<"snapshot" | "decision log" | "flush">();
+  /** The snapshot cannot be written (read-only store): it is no longer pending work (QA-1.3-2). */
+  let snapshotBlocked = false;
+  /** `requestFlush` callers, released when the next flush attempt finishes, whether it succeeded or not. */
+  let waiters: Array<() => void> = [];
+
+  const hasWork = (): boolean => (!snapshotBlocked && store.revision !== writtenRevision) || queue.length > 0;
+
+  function releaseWaiters(list: Array<() => void>): void {
+    for (const release of list) release();
+  }
+
+  function trimQueue(): void {
+    const over = queue.length - maxQueuedRows;
+    if (over > 0) {
+      queue.splice(0, over);
+      droppedRows += over;
+    }
+  }
+
+  function noteFailure(what: "snapshot" | "decision log" | "flush", error: string): void {
+    if (failing.has(what)) return;
+    failing.add(what);
+    logger.warn(`[router] outcome ${what} write failed; will retry`, { error });
+  }
+
+  function noteRecovery(what: "snapshot" | "decision log" | "flush"): void {
+    if (failing.delete(what)) logger.info?.("[router] outcome persistence recovered", { what });
+  }
+
+  /**
+   * Delay before the next flush may start: the rest of the throttle window, clamped to [0, minIntervalMs]. A
+   * clock that went backwards (QA-1.3-3) resets the window instead of stretching it by the jump.
+   */
+  function flushDelay(): number {
+    const t = now();
+    if (t < lastFlushEnd) lastFlushEnd = t;
+    return Math.min(minIntervalMs, Math.max(0, lastFlushEnd + minIntervalMs - t));
+  }
+
+  function schedule(ms: number): void {
+    const slot: { handle: unknown } = { handle: undefined };
+    timer = slot;
+    try {
+      slot.handle = scheduler.setTimer(() => {
+        if (timer === slot) timer = null;
+        void startFlush();
+      }, ms);
+    } catch (error) {
+      if (timer === slot) timer = null;
+      logger.warn("[router] outcome flush could not be scheduled", { error: describeError(error) });
+    }
+  }
+
+  function cancelTimer(): void {
+    const slot = timer;
+    timer = null;
+    if (slot === null) return;
+    try {
+      scheduler.clearTimer(slot.handle);
+    } catch (error) {
+      logger.warn("[router] outcome flush timer could not be cleared", { error: describeError(error) });
+    }
+  }
+
+  /**
+   * Merge what another process wrote into memory before ours is saved. Returns false when the file could not be
+   * checked: the snapshot is then NOT written this round (it stays pending and is retried), because writing
+   * blind could overwrite what we failed to read (QA-1.3-18).
+   */
+  async function absorbForeignWrites(): Promise<boolean> {
+    if (persister.readForeignWrites === undefined || store.mergeForeign === undefined) return true;
+    try {
+      const check = await persister.readForeignWrites(true);
+      if (check.status === "merge") store.mergeForeign(check.disk, check.baseline);
+      if (check.status === "skip") {
+        noteFailure("snapshot", check.reason);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      noteFailure("snapshot", `cannot check for another writer: ${describeError(error)}`);
+      return false;
+    }
+  }
+
+  async function doFlush(): Promise<void> {
+    if (deps.ready !== undefined) await deps.ready;
+    if (!snapshotBlocked && store.revision !== writtenRevision) {
+      const transaction = async (): Promise<void> => {
+        // QA-1.3-4: write `disk + (memory − baseline)`, never plain memory over another process's work
+        const checked = await absorbForeignWrites();
+        const revision = store.revision;
+        const result = checked ? await persister.saveSnapshot(store.snapshot()) : null;
+        if (result === null) {
+          // Skipped, already reported; the snapshot stays pending.
+        } else if (result.ok) {
+          writtenRevision = revision;
+          noteRecovery("snapshot");
+        } else if (result.readOnly === true) {
+          snapshotBlocked = true;
+          failing.delete("snapshot"); // disabled, not recovered
+          logger.warn("[router] outcome snapshots are not written: the store on disk is read-only for this plugin", { error: result.error });
+        } else {
+          noteFailure("snapshot", result.error);
+        }
+      };
+      try {
+        const acquired = persister.withSnapshotLock === undefined
+          ? (await transaction(), true)
+          : await persister.withSnapshotLock(transaction);
+        if (!acquired) {
+          noteFailure("snapshot", "outcomes.json.lock is busy; snapshot remains pending");
+        }
+      } catch (error) {
+        noteFailure("snapshot", describeError(error));
+      }
+    }
+    while (queue.length > 0) {
+      const batch = queue.splice(0, batchRows);
+      const result = await persister.appendRows(batch);
+      if (!result.ok) {
+        queue = batch.concat(queue);
+        trimQueue();
+        noteFailure("decision log", result.error);
+        break;
+      }
+    }
+    if (droppedRows > 0) {
+      logger.warn("[router] outcome decision rows were dropped (queue limit)", { dropped: droppedRows });
+      droppedRows = 0;
+    }
+    if (queue.length === 0) noteRecovery("decision log");
+    noteRecovery("flush");
+  }
+
+  function startFlush(): Promise<void> {
+    const attempt = waiters; // every request made before this attempt started is covered by it
+    waiters = [];
+    const run: Promise<void> = doFlush()
+      .catch((error: unknown) => {
+        noteFailure("flush", describeError(error));
+      })
+      .finally(() => {
+        if (inFlight === run) inFlight = null;
+        const t = now();
+        lastFlushEnd = t;
+        if (!disposed && hasWork() && timer === null) schedule(minIntervalMs);
+        releaseWaiters(attempt);
+        // Nothing left scheduled: later requesters would wait for an attempt that will never run.
+        if (timer === null) {
+          const rest = waiters;
+          waiters = [];
+          releaseWaiters(rest);
+        }
+      });
+    inFlight = run;
+    return run;
+  }
+
+  /** Arm a flush if there is work and none is armed or running. Creates no promise (safe in a hook). */
+  function kick(): void {
+    if (disposed || !hasWork()) return;
+    if (inFlight !== null || timer !== null) return; // the running flush's follow-up / the armed timer covers it
+    schedule(flushDelay());
+  }
+
+  function requestFlush(): Promise<void> {
+    if (disposed || !hasWork()) return Promise.resolve();
+    kick();
+    if (timer === null && inFlight === null) return Promise.resolve(); // could not be scheduled
+    return new Promise<void>((done) => {
+      waiters.push(done);
+    });
+  }
+
+  async function flushNow(): Promise<void> {
+    while (inFlight !== null) await inFlight;
+    cancelTimer();
+    await startFlush();
+  }
+
+  function dispose(): Promise<void> {
+    disposing ??= (async () => {
+      await flushNow();
+      cancelTimer();
+      disposed = true;
+      const rest = waiters;
+      waiters = [];
+      releaseWaiters(rest);
+    })();
+    return disposing;
+  }
+
+  return {
+    get pendingRows(): number {
+      return queue.length;
+    },
+    enqueue(row: LogRow): void {
+      if (disposed) return;
+      queue.push(row);
+      trimQueue();
+      kick();
+    },
+    requestFlush,
+    flushNow,
+    dispose,
+  };
+}

@@ -1,0 +1,735 @@
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  parseCapDirective,
+  buildCapBanner,
+  createSessionStore,
+  classifyTrivial,
+  DEFAULT_TIER_CAPS,
+  type SubagentState,
+  type Cap,
+} from "../../src/router/sessions";
+import { validateConfig } from "../../src/router/config";
+import type { RouterConfig } from "../../src/router/config";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const tiersJson = JSON.parse(readFileSync(join(__dirname, "../../tiers.json"), "utf-8"));
+const fullCfg = validateConfig(tiersJson);
+
+describe("parseCapDirective", () => {
+  it("parses CAP:none (with/without space, any case) → 'none'", () => {
+    expect(parseCapDirective("CAP:none")).toBe("none");
+    expect(parseCapDirective("CAP: none")).toBe("none");
+    expect(parseCapDirective("cap:NONE")).toBe("none");
+  });
+  it("parses positive integers", () => {
+    expect(parseCapDirective("use CAP:5 please")).toBe(5);
+    expect(parseCapDirective("cap:3")).toBe(3);
+  });
+  it("returns null for zero, negatives, non-numeric, and absent", () => {
+    expect(parseCapDirective("CAP:0")).toBeNull();
+    expect(parseCapDirective("CAP:-1")).toBeNull();
+    expect(parseCapDirective("CAP:abc")).toBeNull();
+    expect(parseCapDirective("no directive here")).toBeNull();
+  });
+});
+
+describe("CAP:none justification gate", () => {
+  it("falls back to the tier baseline for an unjustified CAP:none", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_cap_none_bare" },
+      dispatch("CAP:none do a broad survey"),
+      cfg,
+      tierNames,
+    );
+
+    const out: Record<string, unknown> = {};
+    store.recordToolCall(
+      { sessionID: "ses_cap_none_bare", tool: "read", args: { file_path: "a.ts" } },
+      out,
+    );
+
+    expect(out.output).toContain("[cap: 1/8]");
+    expect(out.output).not.toContain("∞");
+  });
+
+  it("honors CAP:none when the dispatch includes a reason line", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_cap_none_reason" },
+      dispatch("CAP:none reason: full-repo audit"),
+      cfg,
+      tierNames,
+    );
+
+    const out: Record<string, unknown> = {};
+    store.recordToolCall(
+      { sessionID: "ses_cap_none_reason", tool: "read", args: { file_path: "a.ts" } },
+      out,
+    );
+
+    expect(out.output).toContain("[cap: 1/∞]");
+  });
+
+  it("leaves numeric CAP:N untouched by the gate", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_cap_numeric_nogate" },
+      dispatch("CAP:2 no justification here"),
+      cfg,
+      tierNames,
+    );
+
+    const out: Record<string, unknown> = {};
+    store.recordToolCall(
+      { sessionID: "ses_cap_numeric_nogate", tool: "read", args: { file_path: "a.ts" } },
+      out,
+    );
+
+    expect(out.output).toContain("[cap: 1/2]");
+  });
+
+  it("re-applies the gate on same-tier resume", () => {
+    const store = createSessionStore();
+    const sessionID = "ses_cap_none_resume_gate";
+
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID },
+      dispatch("CAP:none reason: full-repo audit"),
+      cfg,
+      tierNames,
+    );
+
+    const first: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "a.ts" } }, first);
+    expect(first.output).toContain("[cap: 1/∞]");
+
+    const resumed = store.registerFromChatMessage(
+      { agent: "fast", sessionID },
+      dispatch("CAP:none keep going"),
+      cfg,
+      tierNames,
+    );
+    expect(resumed).toEqual({ registered: true, resumed: true });
+
+    const second: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "b.ts" } }, second);
+
+    expect(second.output).toContain("[cap: 1/8]");
+    expect(second.output).not.toContain("∞");
+  });
+});
+
+function st(partial: Partial<SubagentState> & { cap: Cap; calls: number }): SubagentState {
+  return {
+    tierName: "fast",
+    dispatches: 1,
+    totalCalls: partial.calls,
+    seen: new Map(),
+    trivial: false,
+    ...partial,
+  };
+}
+
+describe("buildCapBanner", () => {
+  it("emits the cap line with numeric cap", () => {
+    const b = buildCapBanner(st({ cap: 8, calls: 1 }), false, undefined, "read");
+    expect(b).toContain("[cap: 1/8]");
+    expect(b).not.toContain("CAP REACHED");
+    expect(b).not.toContain("CAP WARNING");
+  });
+  it("renders ∞ for cap 'none' and never warns/blocks", () => {
+    const b = buildCapBanner(st({ cap: "none", calls: 99 }), false, undefined, "read");
+    expect(b).toContain("[cap: 99/∞]");
+    expect(b).not.toContain("CAP REACHED");
+    expect(b).not.toContain("CAP WARNING");
+  });
+  it("adds a REDUNDANT line citing the previous call #", () => {
+    const b = buildCapBanner(st({ cap: 8, calls: 3 }), true, 1, "grep");
+    expect(b).toContain("⚠ REDUNDANT");
+    expect(b).toContain("grep");
+    expect(b).toContain("call #1");
+  });
+  it("adds CAP REACHED when no calls remain", () => {
+    const b = buildCapBanner(st({ cap: 8, calls: 8 }), false, undefined, "read");
+    expect(b).toContain("⚠ CAP REACHED (8/8)");
+  });
+  it("adds CAP WARNING when 1–2 calls remain", () => {
+    expect(buildCapBanner(st({ cap: 8, calls: 7 }), false, undefined, "read")).toContain("1 read-only call");
+    expect(buildCapBanner(st({ cap: 8, calls: 6 }), false, undefined, "read")).toContain("2 read-only call");
+  });
+});
+
+const cfg = {
+  tierCaps: { fast: 8, medium: 5, heavy: 3 },
+} as unknown as RouterConfig;
+const tierNames = ["fast", "medium", "heavy"];
+
+function dispatch(text: string) {
+  return { parts: [{ text }] };
+}
+
+describe("createSessionStore", () => {
+  it("starts with no tracked sessions", () => {
+    const store = createSessionStore();
+    expect(store.isSubagent("ses_x")).toBe(false);
+  });
+
+  it("ignores messages whose agent is not a tier name", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage({ agent: "build", sessionID: "ses_a" }, dispatch("work"), cfg, tierNames);
+    expect(store.isSubagent("ses_a")).toBe(false);
+  });
+
+  it("tracks a subagent session dispatched to a tier agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage({ agent: "fast", sessionID: "ses_b" }, dispatch("do recon"), cfg, tierNames);
+    expect(store.isSubagent("ses_b")).toBe(true);
+  });
+
+  it("recordToolCall is a no-op for untracked sessions", () => {
+    const store = createSessionStore();
+    const out: Record<string, unknown> = { output: "RESULT" };
+    store.recordToolCall({ sessionID: "ses_unknown", tool: "read", args: { file_path: "a" } }, out);
+    expect(out.output).toBe("RESULT");
+  });
+
+  it("appends a cap banner to read-only tool output, preserving existing text", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage({ agent: "fast", sessionID: "ses_c" }, dispatch("recon"), cfg, tierNames);
+    const out: Record<string, unknown> = { output: "RESULT" };
+    store.recordToolCall({ sessionID: "ses_c", tool: "read", args: { file_path: "a.ts" } }, out);
+    expect(out.output).toContain("RESULT\n\n");
+    expect(out.output).toContain("[cap: 1/8]");
+  });
+
+  it("ignores non-read-only tools (e.g. edit) for tracked sessions", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage({ agent: "fast", sessionID: "ses_d" }, dispatch("recon"), cfg, tierNames);
+    const out: Record<string, unknown> = { output: "EDITED" };
+    store.recordToolCall({ sessionID: "ses_d", tool: "edit", args: { file_path: "a.ts" } }, out);
+    expect(out.output).toBe("EDITED");
+  });
+
+  it("honors a CAP:N override from the dispatch text", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage({ agent: "fast", sessionID: "ses_e" }, dispatch("tight lookup CAP:2"), cfg, tierNames);
+    const o1: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_e", tool: "read", args: { file_path: "a.ts" } }, o1);
+    expect(o1.output).toContain("[cap: 1/2]");
+    const o2: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_e", tool: "read", args: { file_path: "b.ts" } }, o2);
+    expect(o2.output).toContain("⚠ CAP REACHED (2/2)");
+  });
+
+  it("flags a redundant identical read", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage({ agent: "medium", sessionID: "ses_f" }, dispatch("recon"), cfg, tierNames);
+    const o1: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_f", tool: "read", args: { file_path: "same.ts" } }, o1);
+    expect(o1.output).not.toContain("REDUNDANT");
+    const o2: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_f", tool: "read", args: { file_path: "same.ts" } }, o2);
+    expect(o2.output).toContain("⚠ REDUNDANT");
+    expect(o2.output).toContain("call #1");
+  });
+
+  it("falls back to DEFAULT_TIER_CAPS when cfg has no tierCaps", () => {
+    const store = createSessionStore();
+    const bareCfg = {} as unknown as RouterConfig;
+    store.registerFromChatMessage({ agent: "heavy", sessionID: "ses_g" }, dispatch("design"), bareCfg, tierNames);
+    const out: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_g", tool: "read", args: { file_path: "a.ts" } }, out);
+    expect(out.output).toContain(`/${DEFAULT_TIER_CAPS.heavy}]`);
+  });
+
+  // --- extractDispatchText shape coverage: the CAP override only resolves if the
+  // dispatch text was extracted from that payload shape, so the banner cap proves it. ---
+  it("extracts dispatch text from a raw string part", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_h" },
+      { parts: ["please keep it tight CAP:4"] },
+      cfg,
+      tierNames,
+    );
+    const out: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_h", tool: "read", args: { file_path: "a.ts" } }, out);
+    expect(out.output).toContain("[cap: 1/4]");
+  });
+
+  it("extracts dispatch text from a part's `content` field", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_i" },
+      { parts: [{ content: "scoped lookup CAP:6" }] },
+      cfg,
+      tierNames,
+    );
+    const out: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_i", tool: "read", args: { file_path: "a.ts" } }, out);
+    expect(out.output).toContain("[cap: 1/6]");
+  });
+
+  it("falls back to message.content when parts yield no text", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_j" },
+      { parts: [{ irrelevant: true }], message: { content: "do it CAP:7" } },
+      cfg,
+      tierNames,
+    );
+    const out: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "ses_j", tool: "read", args: { file_path: "a.ts" } }, out);
+    expect(out.output).toContain("[cap: 1/7]");
+  });
+});
+
+describe("createSessionStore — markChildSession", () => {
+  it("still registers a tier after the session was marked as a child", () => {
+    const store = createSessionStore();
+    const sessionID = "ses_child_then_tier";
+    store.markChildSession(sessionID);
+    const r = store.registerFromChatMessage(
+      { agent: "fast", sessionID }, dispatch("read a.ts"), fullCfg, tierNames,
+    );
+    expect(r).toEqual({ registered: true, resumed: false });
+    expect(store.getTier(sessionID)).toBe("fast");
+  });
+
+  it("registers mapped agents with the resolved tier and cap", () => {
+    const store = createSessionStore();
+    const mappedCfg = { ...cfg, subagentTiers: { explore: "fast" } };
+    const input = { agent: "explore", sessionID: "mapped" };
+    expect(store.registerFromChatMessage(input, dispatch("work"), mappedCfg, tierNames))
+      .toEqual({ registered: true, resumed: false });
+    expect(store.getTier(input.sessionID)).toBe("fast");
+    expect(store.isSubagent(input.sessionID)).toBe(true);
+    const output = { output: "result" };
+    store.recordToolCall({ sessionID: input.sessionID, tool: "read", args: {} }, output);
+    expect(output.output).toContain("[cap: 1/8]");
+    expect(store.registerFromChatMessage(input, dispatch("work"), mappedCfg, tierNames))
+      .toEqual({ registered: true, resumed: true });
+  });
+
+  it("does not register mappings to tiers absent from the active preset", () => {
+    const store = createSessionStore();
+    expect(store.registerFromChatMessage(
+      { agent: "explore", sessionID: "invalid" }, dispatch("work"),
+      { ...cfg, subagentTiers: { explore: "nonexistent-tier" } }, tierNames,
+    )).toEqual({ registered: false, resumed: false });
+    expect(store.getTier("invalid")).toBeNull();
+    expect(store.isSubagent("invalid")).toBe(false);
+  });
+
+  it("marks a child as a subagent", () => {
+    const store = createSessionStore();
+    store.markChildSession("ses_child");
+    expect(store.isSubagent("ses_child")).toBe(true);
+  });
+
+  it("assigns neither a tier nor cap state", () => {
+    const store = createSessionStore();
+    store.markChildSession("ses_child_untiered");
+    expect(store.getTier("ses_child_untiered")).toBeNull();
+    expect(store.isTrivial("ses_child_untiered")).toBe(false);
+  });
+
+  it("leaves untiered child tool output byte-identical without a banner", () => {
+    const store = createSessionStore();
+    const sessionID = "ses_child_output";
+    store.markChildSession(sessionID);
+    const outputRef = { output: "x" };
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "a.ts" } }, outputRef);
+    expect(outputRef.output).toBe("x");
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "a.ts" } }, outputRef);
+    expect(outputRef.output).toBe("x");
+  });
+
+  it("classifies a non-tier agent only through the child-session path", () => {
+    const store = createSessionStore();
+    const sessionID = "ses_child_general";
+    store.registerFromChatMessage({ agent: "general", sessionID }, dispatch("work"), cfg, tierNames);
+    expect(store.isSubagent(sessionID)).toBe(false);
+    store.markChildSession(sessionID);
+    expect(store.isSubagent(sessionID)).toBe(true);
+    expect(store.getTier(sessionID)).toBeNull();
+  });
+
+  it("ignores an empty session ID", () => {
+    const store = createSessionStore();
+    store.markChildSession("");
+    expect(store.isSubagent("")).toBe(false);
+    expect(store.getTier("")).toBeNull();
+    expect(store.isTrivial("")).toBe(false);
+  });
+
+  it("evicts a child-marked session after the idle TTL", () => {
+    let clock = 100;
+    const store = createSessionStore({ now: () => clock });
+    store.markChildSession("ses_child_idle");
+    clock += 999;
+    store.sweep(clock, 1000);
+    expect(store.isSubagent("ses_child_idle")).toBe(true);
+    clock += 1;
+    store.sweep(clock, 1000);
+    expect(store.isSubagent("ses_child_idle")).toBe(false);
+  });
+
+  it("preserves an already registered tier and its cap state", () => {
+    const store = createSessionStore();
+    const sessionID = "ses_child_tiered";
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID },
+      dispatch("read a.ts CAP:4"),
+      fullCfg,
+      tierNames,
+    );
+    const first: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "a.ts" } }, first);
+    expect(first.output).toContain("[cap: 1/4]");
+
+    store.markChildSession(sessionID);
+    expect(store.isSubagent(sessionID)).toBe(true);
+    expect(store.getTier(sessionID)).toBe("fast");
+    expect(store.isTrivial(sessionID)).toBe(true);
+    const second: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID, tool: "read", args: { file_path: "a.ts" } }, second);
+    expect(second.output).toContain("[cap: 2/4]");
+    expect(second.output).toContain("REDUNDANT");
+    expect(second.output).toContain("call #1");
+  });
+});
+
+describe("classifyTrivial", () => {
+  it("fast tier + 'search the codebase for X' => true", () => {
+    expect(classifyTrivial("search the codebase for X", "fast", fullCfg)).toBe(true);
+  });
+  it("fast tier + 'grep for the handler' => true", () => {
+    expect(classifyTrivial("grep for the handler", "fast", fullCfg)).toBe(true);
+  });
+  it("fast tier + 'refactor the auth module' => false (medium disqualifier)", () => {
+    expect(classifyTrivial("refactor the auth module", "fast", fullCfg)).toBe(false);
+  });
+  it("medium tier + 'search' text => false (tier gate)", () => {
+    expect(classifyTrivial("search the codebase for X", "medium", fullCfg)).toBe(false);
+  });
+  it("heavy tier + any text => false", () => {
+    expect(classifyTrivial("search the codebase", "heavy", fullCfg)).toBe(false);
+  });
+  it("null tier => false", () => {
+    expect(classifyTrivial("search the codebase", null, fullCfg)).toBe(false);
+  });
+  it("empty text => false", () => {
+    expect(classifyTrivial("", "fast", fullCfg)).toBe(false);
+  });
+  it("fast tier + no matching keyword => false", () => {
+    expect(classifyTrivial("do the thing xyz", "fast", fullCfg)).toBe(false);
+  });
+
+  // --- narrowing: trivial means SINGLE-SHOT lookup, not merely "read-only" ---
+  // Before this narrowing every case below returned true, which exempted
+  // multi-file @fast recon from enforced-mode hard blocks.
+
+  it("single named file => true (the canonical single-shot lookup)", () => {
+    expect(
+      classifyTrivial("read package.json and tell me the version", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("multi-file recon (6 paths) => false (path-count gate)", () => {
+    expect(
+      classifyTrivial(
+        "read README.md, package.json, tsconfig.json, tiers.json, LICENSE.md and src/index.ts",
+        "fast",
+        fullCfg,
+      ),
+    ).toBe(false);
+  });
+
+  it("two named files => false (exceeds MAX_TRIVIAL_PATHS)", () => {
+    expect(
+      classifyTrivial("read package.json and tsconfig.json", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("same file named twice => true (paths are de-duplicated)", () => {
+    expect(
+      classifyTrivial("read package.json and recheck package.json", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("'then' sequencing marker => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read the config then summarise it", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'one at a time' marker => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read these files one at a time using the read tool", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'each' distributive marker => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("search each module for the handler", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("numbered list => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read the following:\n1. the config\n2. the manifest", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("bulleted list => false (multi-step gate)", () => {
+    expect(
+      classifyTrivial("read the following:\n- the config\n- the manifest", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("long prose brief with no markers => false (length backstop)", () => {
+    const long = "read the source and report back. " + "context filler. ".repeat(20);
+    expect(long.length).toBeGreaterThan(240);
+    expect(classifyTrivial(long, "fast", fullCfg)).toBe(false);
+  });
+
+  it("the cwd/platform footer alone does not defeat trivial", () => {
+    // Dispatch prompts commonly arrive with this footer. It is NOT emitted by
+    // this plugin -- it comes from the host/orchestrator prompt conventions --
+    // which is exactly why PATH_TOKEN_RE requires a file extension: a POSIX cwd
+    // must not be counted as a target file, and the footer must not blow the
+    // length gate.
+    const withFooter =
+      "read package.json and tell me the version" +
+      "\n\nWorking directory: /home/u/proj\nPlatform: linux\nShell: bash";
+    expect(classifyTrivial(withFooter, "fast", fullCfg)).toBe(true);
+  });
+
+  it("the guard-hardblock smoke prompt is NOT trivial (regression pin)", () => {
+    // Verbatim from test/smoke/guard-hardblock.smoke.test.ts. This returning
+    // true is the bug that made the read_budget guard unfireable on @fast.
+    const smokePrompt =
+      "Read these files ONE AT A TIME using the read tool, in this exact order, " +
+      "and after each give a one-line summary: README.md, then package.json, then " +
+      "tsconfig.json, then tiers.json, then LICENSE, then src/index.ts. Use the " +
+      "read tool separately for each file; do not skip any.";
+    expect(classifyTrivial(smokePrompt, "fast", fullCfg)).toBe(false);
+  });
+
+  // --- zero-path recon holes: breadth that names no extensioned file ---
+
+  it("directory-level recon enumerating 3 subjects => false (enumeration gate)", () => {
+    // Names no file at all, so the path count cannot catch it.
+    expect(
+      classifyTrivial(
+        "search the src directory structure and report how router, guard and verify are organized",
+        "fast",
+        fullCfg,
+      ),
+    ).toBe(false);
+  });
+
+  it("extensionless real files count as paths => false", () => {
+    expect(
+      classifyTrivial(
+        "read Makefile, LICENSE and Dockerfile and summarize the build",
+        "fast",
+        fullCfg,
+      ),
+    ).toBe(false);
+  });
+
+  it("a single extensionless file is still trivial", () => {
+    expect(classifyTrivial("read Makefile and tell me the default target", "fast", fullCfg)).toBe(
+      true,
+    );
+  });
+
+  it("'license' as a prose word is not a path (case-sensitive gate)", () => {
+    expect(
+      classifyTrivial("read the license field in package.json", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("semicolon-chained greps => false (connector gate)", () => {
+    expect(
+      classifyTrivial("grep for foo; grep for bar", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("&&-chained greps => false (connector gate)", () => {
+    expect(
+      classifyTrivial("grep for foo && grep for bar", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'Step 1: ... Step 2: ...' => false (step marker with colon)", () => {
+    expect(
+      classifyTrivial("Step 1: read the config. Step 2: report the value", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("colon-numbered list at line start => false", () => {
+    expect(
+      classifyTrivial("read the following:\n1: the config\n2: the manifest", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("two imperative lines => false (prose task list)", () => {
+    expect(
+      classifyTrivial("search for the handler\nreport what it returns", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  // --- distributive breadth: "every"/"all" over a class of targets ---
+  // Bare fan-out phrasing with no comma, no connector, no second line, no named
+  // path and well under the length backstop. `each` and `for every` are already
+  // caught by the multi-step gate; these forms were the residual hole.
+
+  it("'every <collective>' => false (distributive gate)", () => {
+    expect(classifyTrivial("search every config file", "fast", fullCfg)).toBe(false);
+  });
+
+  it("'all <plural>' => false (distributive gate)", () => {
+    expect(
+      classifyTrivial("read all guard modules and tell me what they export", "fast", fullCfg),
+    ).toBe(false);
+  });
+
+  it("'all the <plural>' => false (distributive gate)", () => {
+    expect(classifyTrivial("grep all the tests for the handler", "fast", fullCfg)).toBe(false);
+  });
+
+  it("'every line of <file>' stays trivial (depth over ONE file, not breadth)", () => {
+    expect(classifyTrivial("read every line of package.json", "fast", fullCfg)).toBe(true);
+  });
+
+  it("'all of <path>' stays trivial (quantifier scopes a single named file)", () => {
+    expect(classifyTrivial("read all of src/index.ts", "fast", fullCfg)).toBe(true);
+  });
+
+  it("'all this' is not a plural target (stays trivial)", () => {
+    // "this" ends in `s` but is singular -- the generic plural branch must not
+    // treat it as a class of targets.
+    expect(
+      classifyTrivial("read all this and tell me what it means in tiers.json", "fast", fullCfg),
+    ).toBe(true);
+  });
+
+  it("two-item comma phrase is not an enumeration (stays trivial)", () => {
+    // Only 3+ items signal breadth; two items are common in single-shot asks and
+    // a genuine two-file ask is already caught by the path count.
+    expect(classifyTrivial("grep for the handler, quickly", "fast", fullCfg)).toBe(true);
+  });
+});
+
+describe("createSessionStore — isTrivial", () => {
+  it("returns true for a fast subagent whose dispatch matches a fast keyword", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_triv1" },
+      dispatch("grep for the handler"),
+      fullCfg,
+      tierNames,
+    );
+    expect(store.isTrivial("ses_triv1")).toBe(true);
+  });
+  it("returns false for a medium subagent regardless of text", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "medium", sessionID: "ses_triv2" },
+      dispatch("search the codebase"),
+      fullCfg,
+      tierNames,
+    );
+    expect(store.isTrivial("ses_triv2")).toBe(false);
+  });
+  it("returns false for an unknown session", () => {
+    const store = createSessionStore();
+    expect(store.isTrivial("unknown-session")).toBe(false);
+  });
+  it("returns false for a fast dispatch with no matching keyword", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_triv3" },
+      dispatch("implement the feature"),
+      fullCfg,
+      tierNames,
+    );
+    expect(store.isTrivial("ses_triv3")).toBe(false);
+  });
+});
+
+describe("registerProducerSession / unregister", () => {
+  it("registers session: isSubagent=true, getTier=tier, isTrivial=false", () => {
+    const store = createSessionStore();
+    store.registerProducerSession("prod_a", "medium", cfg);
+    expect(store.isSubagent("prod_a")).toBe(true);
+    expect(store.getTier("prod_a")).toBe("medium");
+    expect(store.isTrivial("prod_a")).toBe(false);
+  });
+
+  it("cap baseline comes from cfg.tierCaps when present", () => {
+    const customCfg = { tierCaps: { medium: 10 } } as unknown as RouterConfig;
+    const store = createSessionStore();
+    store.registerProducerSession("prod_b", "medium", customCfg);
+    const out: Record<string, unknown> = {};
+    store.recordToolCall({ sessionID: "prod_b", tool: "read", args: { file_path: "x.ts" } }, out);
+    expect(out.output).toContain("1/10");
+  });
+
+  it("after unregister: isSubagent=false, getTier=null", () => {
+    const store = createSessionStore();
+    store.registerProducerSession("prod_c", "heavy", cfg);
+    expect(store.isSubagent("prod_c")).toBe(true);
+    store.unregister("prod_c");
+    expect(store.isSubagent("prod_c")).toBe(false);
+    expect(store.getTier("prod_c")).toBeNull();
+  });
+});
+
+describe("createSessionStore — getTier", () => {
+  it("returns the tier name after registerFromChatMessage for a tier agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "fast", sessionID: "ses_tier1" },
+      dispatch("explore the repo"),
+      cfg,
+      tierNames,
+    );
+    expect(store.getTier("ses_tier1")).toBe("fast");
+  });
+
+  it("returns the tier name for a heavy agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "heavy", sessionID: "ses_tier2" },
+      dispatch("architecture review"),
+      cfg,
+      tierNames,
+    );
+    expect(store.getTier("ses_tier2")).toBe("heavy");
+  });
+
+  it("returns null for an unknown / unregistered session", () => {
+    const store = createSessionStore();
+    expect(store.getTier("unknown-session")).toBeNull();
+  });
+
+  it("returns null for a session registered via a non-tier agent", () => {
+    const store = createSessionStore();
+    store.registerFromChatMessage(
+      { agent: "unknown-agent", sessionID: "ses_tier3" },
+      dispatch("do something"),
+      cfg,
+      tierNames,
+    );
+    expect(store.getTier("ses_tier3")).toBeNull();
+  });
+});

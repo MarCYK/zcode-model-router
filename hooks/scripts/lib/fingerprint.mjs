@@ -6,8 +6,17 @@
 export function fingerprintToolCall(tool, args) {
   const a = (args ?? {}) ?? {};
   switch (tool) {
-    case "read":
-      return `read:${a.file_path ?? a.filePath ?? ""}`;
+    case "read": {
+      // Fixed field order preserves repeats regardless of argument insertion order.
+      // Keep path-only fingerprints unchanged when no range was supplied.
+      const range = Object.fromEntries(
+        ["offset", "limit", "start", "end", "line", "lines", "range"]
+          .filter((key) => a[key] != null)
+          .map((key) => [key, a[key]]),
+      );
+      const suffix = Object.keys(range).length ? `:${JSON.stringify(range)}` : "";
+      return `read:${a.file_path ?? a.filePath ?? ""}${suffix}`;
+    }
     case "grep":
       return `grep:${a.pattern ?? ""}:${a.path ?? a.glob ?? ""}`;
     case "glob":

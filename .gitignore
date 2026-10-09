@@ -6,3 +6,7 @@ Thumbs.db
 tmp/
 coverage/
 .zcode/
+.opencode/
+.env
+# QA-G-9 safety: Windows PowerShell module analysis cache, written relative to its cwd
+/Microsoft/

@@ -1,0 +1,335 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, it, expect } from "vitest";
+import {
+  getActiveTiers,
+  getActiveMode,
+  buildFallbackInstructions,
+  buildTaskTaxonomy,
+  buildDecomposeHint,
+  buildDelegationProtocol,
+  buildDoDProtocolSection,
+  isClaudeModel,
+  isAdaptiveOnlyClaudeModel,
+  assembleSystemPrompt,
+  DELEGATION_PROTOCOL_HEADING,
+  swapTaxonomyLine,
+  buildRouteLineProtocol,
+} from "../../src/router/protocol";
+import { validateConfig } from "../../src/router/config";
+import type { RouterConfig } from "../../src/router/config";
+
+function tier(model: string, extra: Record<string, unknown> = {}) {
+  return { model, description: "d", whenToUse: [], ...extra };
+}
+
+/** Minimal config: single tier, no modes/taskPatterns/fallback/costRatio/variant. */
+const minimal = {
+  activePreset: "p",
+  presets: { p: { only: tier("prov/model-x") } },
+  rules: ["alpha", "beta"],
+  defaultTier: "only",
+} as unknown as RouterConfig;
+
+/** Rich config: multi-tier with costRatio + variant, modes w/ overrideRules, taskPatterns, fallback. */
+const rich = {
+  activePreset: "anthropic",
+  activeMode: "budget",
+  presets: {
+    anthropic: {
+      fast: tier("anthropic/claude-haiku-4-5", { costRatio: 1 }),
+      medium: tier("anthropic/claude-sonnet-4-6", { costRatio: 5, variant: "max" }),
+    },
+    openai: { fast: tier("openai/gpt-x", { costRatio: 1 }) },
+  },
+  rules: ["base1"],
+  defaultTier: "fast",
+  modes: { budget: { defaultTier: "fast", description: "cheap", overrideRules: ["o1", "o2"] } },
+  taskPatterns: { fast: ["recon", "lookup"], medium: ["impl"] },
+  fallback: { global: { anthropic: ["openai"] } },
+} as unknown as RouterConfig;
+
+describe("getActiveTiers", () => {
+  it("returns the active preset's tiers", () => {
+    expect(Object.keys(getActiveTiers(rich))).toEqual(["fast", "medium"]);
+  });
+  it("falls back to the first preset when activePreset is unknown", () => {
+    const cfg = { ...rich, activePreset: "missing" } as unknown as RouterConfig;
+    expect(getActiveTiers(cfg)).toBeDefined();
+  });
+});
+
+describe("getActiveMode", () => {
+  it("returns undefined when modes or activeMode absent", () => {
+    expect(getActiveMode(minimal)).toBeUndefined();
+  });
+  it("returns the active mode object when present", () => {
+    expect(getActiveMode(rich)?.defaultTier).toBe("fast");
+  });
+});
+
+describe("buildTaskTaxonomy", () => {
+  it("returns '' when taskPatterns absent", () => {
+    expect(buildTaskTaxonomy(minimal)).toBe("");
+  });
+  it("builds a taxonomy line when present", () => {
+    const out = buildTaskTaxonomy(rich);
+    expect(out).toContain("R:");
+    expect(out).toContain("@fast→recon/lookup");
+  });
+  it("skips empty pattern arrays", () => {
+    const cfg = { ...rich, taskPatterns: { fast: [] } } as unknown as RouterConfig;
+    expect(buildTaskTaxonomy(cfg)).toBe("R:");
+  });
+});
+
+describe("buildDecomposeHint", () => {
+  it("returns '' when the active mode has overrideRules", () => {
+    expect(buildDecomposeHint(rich)).toBe("");
+  });
+  it("returns '' when fewer than 2 tiers", () => {
+    expect(buildDecomposeHint(minimal)).toBe("");
+  });
+  it("returns an explore→execute hint for >=2 tiers in normal mode", () => {
+    const cfg = { ...rich, activeMode: undefined, modes: undefined } as unknown as RouterConfig;
+    const out = buildDecomposeHint(cfg);
+    expect(out).toContain("explore(@fast)→execute(@medium)");
+  });
+});
+
+describe("buildFallbackInstructions", () => {
+  it("returns '' when no fallback configured", () => {
+    expect(buildFallbackInstructions(minimal)).toBe("");
+  });
+  it("uses fb.global when no preset-specific map", () => {
+    const out = buildFallbackInstructions(rich);
+    expect(out).toContain("anthropic→openai");
+  });
+  it("prefers a non-empty preset-specific map over global", () => {
+    const cfg = {
+      ...rich,
+      fallback: { presets: { anthropic: { x: ["openai"] } }, global: { y: ["openai"] } },
+    } as unknown as RouterConfig;
+    expect(buildFallbackInstructions(cfg)).toContain("x→openai");
+  });
+  it("returns '' when the chain map yields no valid targets", () => {
+    const cfg = { ...rich, fallback: { global: { anthropic: ["nonexistent"] } } } as unknown as RouterConfig;
+    expect(buildFallbackInstructions(cfg)).toBe("");
+  });
+  it("skips non-array chain entries", () => {
+    const cfg = { ...rich, fallback: { global: { anthropic: "openai" } } } as unknown as RouterConfig;
+    expect(buildFallbackInstructions(cfg)).toBe("");
+  });
+});
+
+describe("buildDelegationProtocol", () => {
+  it("renders minimal config without optional sections (no costRatio/mode/taxonomy/fallback)", () => {
+    const out = buildDelegationProtocol(minimal);
+    expect(out).toContain("Preset: p.");
+    expect(out).toContain("@only=model-x"); // no variant, no (Nx)
+    expect(out).not.toContain("mode:");
+    expect(out).toContain("1.alpha 2.beta"); // cfg.rules, no overrideRules
+  });
+  it("renders rich config with variant, costRatio, mode suffix and overrideRules", () => {
+    const out = buildDelegationProtocol(rich);
+    expect(out).toContain("@medium=claude-sonnet-4-6/max(5x)");
+    expect(out).toContain("mode:budget");
+    expect(out).toContain("1.o1 2.o2"); // overrideRules win
+    expect(out).toContain("R:"); // taxonomy present
+    expect(out).toContain("Chain:"); // fallback present
+  });
+});
+
+describe("isClaudeModel", () => {
+  it.each([
+    ["undefined", undefined, false],
+    ["anthropic/ prefix", "anthropic/claude-haiku-4-5", true],
+    ["claude- in path", "bedrock/claude-3-sonnet", true],
+    ["leading claude-", "claude-3-opus", true],
+    ["non-claude", "openai/gpt-5", false],
+  ])("%s", (_label, model, expected) => {
+    expect(isClaudeModel(model as string | undefined)).toBe(expected);
+  });
+});
+
+describe("isAdaptiveOnlyClaudeModel", () => {
+  it.each([
+    // The catalogue's rejects_disabled_thinking set, bare and prefixed.
+    ["claude-opus-5-5", true],
+    ["anthropic/claude-opus-5-5", true],
+    ["anthropic/claude-fable-5", true],
+    ["anthropic/claude-fable-5-1", true],
+    ["anthropic/claude-mythos-5-1", true],
+    ["github-copilot/claude-fable-5-1", true],
+    ["ANTHROPIC/Claude-Opus-5-5", true],
+    // Re-spellings and suffixes of a listed model.
+    ["github-copilot/claude-fable-5.1", true],
+    ["anthropic/claude-opus-5-5-20260901", true],
+    ["anthropic/claude-opus-5-5[1m]", true],
+    ["google-vertex/claude-opus-5-5@20260901", true],
+    ["anthropic/claude-opus-5-5-20260901[1m]", true],
+    // Proxied spellings isClaudeModel accepts.
+    ["openrouter/anthropic/claude-opus-5-5", true],
+    // Unknown suffixes fail open: the gate fires only on a positive match.
+    ["anthropic/claude-opus-5-5-latest", false],
+    // isClaudeModel needs `/` or `-` before `claude-`, so a dotted Bedrock
+    // namespace is not recognised as Claude at all; the gate inherits that.
+    ["bedrock/us.anthropic.claude-opus-5-5-v1:0", false],
+    // Neighbours that still accept a manual budget.
+    ["anthropic/claude-opus-5", false],
+    ["anthropic/claude-opus-5-20260901", false],
+    ["anthropic/claude-mythos-5", false],
+    ["anthropic/claude-sonnet-5", false],
+    ["anthropic/claude-opus-4-8", false],
+    ["anthropic/claude-opus-5-55", false],
+    ["anthropic/claude-fable-5-2", false],
+    ["anthropic/claude-mythos-5-1-preview", false],
+    // Not Claude at all.
+    ["openai/opus-5-5", false],
+    ["openai/gpt-5", false],
+    [undefined, false],
+    ["", false],
+  ])("%s -> %s", (model, expected) => {
+    expect(isAdaptiveOnlyClaudeModel(model as string | undefined)).toBe(expected);
+  });
+});
+
+describe("assembleSystemPrompt", () => {
+  it("prepends the Claude override for Claude orchestrators (anti-narration off by default)", () => {
+    const out = assembleSystemPrompt(minimal, "anthropic/claude-haiku-4-5");
+    expect(out).toContain("AUTHORITY OVERRIDE");
+    expect(out).not.toContain("ANTI-NARRATION");
+    expect(out).toContain("## Model Delegation Protocol");
+  });
+  it("adds the anti-narration clause only when antiNarration is enabled", () => {
+    const on = { ...minimal, antiNarration: true };
+    expect(assembleSystemPrompt(on, "anthropic/claude-haiku-4-5")).toContain("ANTI-NARRATION");
+  });
+  it("returns the bare protocol for non-Claude orchestrators", () => {
+    const out = assembleSystemPrompt(minimal, "openai/gpt-5");
+    expect(out.startsWith("## Model Delegation Protocol")).toBe(true);
+    expect(out).not.toContain("AUTHORITY OVERRIDE");
+  });
+});
+
+describe("buildDoDProtocolSection", () => {
+  const raw = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8"));
+  const base = validateConfig(raw);
+
+  it("contains [acceptance] and required check examples", () => {
+    const out = buildDoDProtocolSection(base);
+    expect(out).toContain("[acceptance]");
+    expect(out).toContain("check: testsPass");
+    expect(out).toContain("schemaMatch");
+  });
+
+  it("yields 'auto-inferred' wording by default", () => {
+    const out = buildDoDProtocolSection(base);
+    expect(out).toContain("auto-inferred");
+    expect(out).not.toContain("REQUIRED");
+  });
+
+  it("yields 'REQUIRED' wording when requireExplicitDoD is true", () => {
+    const cfg = { ...base };
+    cfg.enforcement = { verify: { requireExplicitDoD: true } };
+    const out = buildDoDProtocolSection(cfg);
+    expect(out).toContain("REQUIRED");
+    expect(out).not.toContain("auto-inferred");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2.2 seams: the generated R: line and the route-line paragraph (advise / enforce only)
+// ---------------------------------------------------------------------------
+
+/** `rich` in normal mode: the decomposition hint is present and the taxonomy line is `R: @fast→recon/lookup @medium→impl`. */
+const normal = { ...rich, activeMode: undefined } as unknown as RouterConfig;
+/** The same without taskPatterns: no `R:` line in the protocol. */
+const noTaxonomy = { ...normal, taskPatterns: undefined } as unknown as RouterConfig;
+
+describe("DELEGATION_PROTOCOL_HEADING", () => {
+  it("is the first line of the delegation protocol", () => {
+    expect(buildDelegationProtocol(normal).split("\n")[0]).toBe(DELEGATION_PROTOCOL_HEADING);
+    expect(assembleSystemPrompt(normal, undefined, true).includes(DELEGATION_PROTOCOL_HEADING)).toBe(true);
+  });
+});
+
+describe("swapTaxonomyLine", () => {
+  const base = buildTaskTaxonomy(normal);
+
+  it("with the shipped line it returns the protocol untouched, byte for byte (D2)", () => {
+    const protocol = buildDelegationProtocol(normal);
+    expect(swapTaxonomyLine(protocol, normal, base)).toBe(protocol);
+    expect(swapTaxonomyLine(assembleSystemPrompt(normal, "anthropic/claude-opus-5-5", true), normal, base)).toBe(assembleSystemPrompt(normal, "anthropic/claude-opus-5-5", true));
+  });
+
+  it("replaces only the R: line, in place", () => {
+    const protocol = buildDelegationProtocol(normal);
+    const swapped = swapTaxonomyLine(protocol, normal, `${base} | by class: search→@explore`);
+    expect(swapped).toBe(protocol.replace(base, () => `${base} | by class: search→@explore`));
+    expect(swapped.split("\n").length).toBe(protocol.split("\n").length);
+  });
+
+  it("splices: `$&`, `$1` and `$$` inside agent ids are literal (QA-1.4-11)", () => {
+    const protocol = buildDelegationProtocol(normal);
+    const line = `${base} | by class: search→@a$&b$1c$$d`;
+    const swapped = swapTaxonomyLine(protocol, normal, line);
+    expect(swapped).toContain("@a$&b$1c$$d");
+    expect(swapped.split(base).length).toBe(2);
+  });
+
+  it("inserts the line before the decomposition hint when the protocol has no R: line", () => {
+    const protocol = buildDelegationProtocol(noTaxonomy);
+    expect(protocol).not.toContain("R:");
+    const swapped = swapTaxonomyLine(protocol, noTaxonomy, "R: by class: search→@explore");
+    const lines = swapped.split("\n");
+    const at = lines.indexOf("R: by class: search→@explore");
+    expect(at).toBeGreaterThan(0);
+    expect(lines[at - 1]).toBe("");
+    expect(lines[at + 1]).toBe("");
+    expect(lines[at + 2]).toBe(buildDecomposeHint(noTaxonomy));
+    expect(swapped.replace("R: by class: search→@explore\n\n", "")).toBe(protocol);
+  });
+
+  it("inserts before `Rules:` when there is no decomposition hint either", () => {
+    const bare = { ...noTaxonomy, activeMode: "budget" } as unknown as RouterConfig;
+    expect(buildDecomposeHint(bare)).toBe("");
+    const protocol = buildDelegationProtocol(bare);
+    const swapped = swapTaxonomyLine(protocol, bare, "R: by class: search→@explore");
+    expect(swapped.split("\n").indexOf("R: by class: search→@explore")).toBeGreaterThan(0);
+    expect(swapped.indexOf("R: by class")).toBeLessThan(swapped.indexOf("Rules: "));
+    expect(swapped.replace("R: by class: search→@explore\n\n", "")).toBe(protocol);
+  });
+
+  it("leaves a text that does not carry the base line, an empty line and an unanchored text alone", () => {
+    expect(swapTaxonomyLine("a stripped child prompt", normal, `${base} | by class: x→@y`)).toBe("a stripped child prompt");
+    expect(swapTaxonomyLine("no anchors here", noTaxonomy, "R: by class: x→@y")).toBe("no anchors here");
+    const protocol = buildDelegationProtocol(noTaxonomy);
+    expect(swapTaxonomyLine(protocol, noTaxonomy, "")).toBe(protocol);
+  });
+});
+
+describe("buildRouteLineProtocol (D13, A22, §0.10.11)", () => {
+  for (const mode of ["advise", "enforce"] as const) {
+    it(`${mode}: says FIRST line, documents pin and the vocabularies, and never asks the orchestrator to choose a model`, () => {
+      const text = buildRouteLineProtocol(mode);
+      expect(text).toContain("FIRST line");
+      expect(text).toContain("`[route class=<c> risk=<r> scope=<s> needs=<n,..> pin]`");
+      expect(text).toContain("search|recon|mechanical|implement|debug|design|review|other");
+      expect(text).toContain("low|medium|high");
+      expect(text).toContain("single|multi|repo");
+      expect(text).toContain("shell|web|edit|network|external_dir");
+      expect(text).toContain("bare flag `pin`");
+      expect(text).toContain("QA review");
+      expect(text).toContain("Route hint");
+      expect(text).not.toMatch(/\bmodel\b/i);
+      expect(text).not.toMatch(/\bTask\s*\(/);
+    });
+  }
+
+  it("enforce says the router may switch; advise says it does not", () => {
+    expect(buildRouteLineProtocol("enforce")).toContain("may start a dispatch on another agent");
+    expect(buildRouteLineProtocol("advise")).toContain("does not change your dispatches");
+    expect(buildRouteLineProtocol("advise")).not.toContain("may start a dispatch");
+  });
+});

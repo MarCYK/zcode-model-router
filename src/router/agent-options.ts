@@ -1,0 +1,205 @@
+import type { PluginLogger } from "./logger";
+/**
+ * Registration-path agent options.
+ *
+ * `src/index.ts` turns each tier of the active preset into an opencode agent
+ * definition; this module owns the `options` bag on that definition. It is the
+ * only place that knows how a tier's provider-agnostic `effort` maps onto the
+ * provider-specific knob (`effort` for Anthropic, `reasoningEffort` for
+ * OpenAI) and what to do when a tier asks for something the provider cannot do.
+ *
+ * The display-path builder in `src/commands/output.ts` renders what a tier is
+ * configured with; this one decides what is actually sent. They are kept apart
+ * on purpose: `/tiers` should not warn, downgrade or drop keys.
+ */
+import type { EffortLevel, TierConfig } from "./config";
+import { EFFORT_LEVELS } from "./config";
+import { isAdaptiveOnlyClaudeModel, isClaudeModel } from "./protocol";
+
+// ---------------------------------------------------------------------------
+// Warn-once
+// ---------------------------------------------------------------------------
+
+// Agent registration runs on every `config` hook, so an unqualified
+// console.warn would repeat the same line for the life of the session. Keys are
+// deliberately tight (tier name + offending value where the value matters), so
+// two different mistakes are still two different warnings.
+const warnedAgentOptionsEffort = new Set<string>();
+
+export function warnAgentOptionsEffortOnce(
+  key: string,
+  message: string,
+  logger?: PluginLogger,
+): void {
+  if (warnedAgentOptionsEffort.has(key)) return;
+  warnedAgentOptionsEffort.add(key);
+  // Optional so this module keeps working for callers that have no client
+  // (unit tests, and buildAgentOptions being called directly).
+  if (logger) {
+    logger.warn(message, { key });
+    return;
+  }
+  console.warn(`[model-router] ${message}`);
+}
+
+export function resetAgentOptionsEffortWarnings(): void {
+  warnedAgentOptionsEffort.clear();
+}
+
+function isEffortLevel(value: unknown): value is (typeof EFFORT_LEVELS)[number] {
+  return typeof value === "string" && EFFORT_LEVELS.some((level) => level === value);
+}
+
+function isOpenAIModel(model: string): boolean {
+  const s = model.toLowerCase();
+  return s.startsWith("openai/") || /\bgpt-/.test(s) || /(^|[/\-_])o[134]([/\-_]|$)/.test(s);
+}
+
+export function effortRank(level: EffortLevel): number {
+  return EFFORT_LEVELS.indexOf(level);
+}
+
+export function nextEffort(current: EffortLevel, bound: EffortLevel): EffortLevel | null {
+  return effortRank(current) < effortRank(bound)
+    ? EFFORT_LEVELS[effortRank(current) + 1]!
+    : null;
+}
+
+export function minEffort(a: EffortLevel, b: EffortLevel): EffortLevel {
+  return effortRank(a) <= effortRank(b) ? a : b;
+}
+
+export function effortCeilingFor(tier: TierConfig): EffortLevel | null {
+  if (tier.variant || tier.effort === undefined || !isEffortLevel(tier.effort)) return null;
+  if (isClaudeModel(tier.model)) {
+    if (Boolean(tier.thinking?.budgetTokens) && !isAdaptiveOnlyClaudeModel(tier.model)) return null;
+    return "max";
+  }
+  if (isOpenAIModel(tier.model)) {
+    if (tier.reasoning?.effort) return null;
+    return "high";
+  }
+  return null;
+}
+
+/**
+ * Provider-specific agent options for a tier, as registered with opencode.
+ *
+ * Precedence, highest first: explicit `thinking` with a truthy `budgetTokens`
+ * (Anthropic) or explicit `reasoning.effort` (OpenAI), then the
+ * provider-agnostic `effort`. A `budgetTokens` of 0 asks for nothing and so
+ * loses to `effort`, with a one-time notice per tier.
+ *
+ * Explicit fields are gated by model: a Claude model never receives
+ * `reasoningEffort` / `reasoningSummary`, and an adaptive-only Claude model
+ * (`isAdaptiveOnlyClaudeModel`) never receives `thinking` — the budget is
+ * then ignored as if unset, so `effort` still applies. Each drop warns once
+ * per tier. A key is
+ * only ever present when something asked for it — an unset `effort` leaves no
+ * trace in the returned object.
+ */
+export function buildAgentOptions(
+  tier: TierConfig,
+  tierName = tier.model,
+  logger?: PluginLogger,
+): Record<string, unknown> {
+  const opts: Record<string, unknown> = {};
+
+  // Anthropic thinking config. A zero budget asks for no extended thinking at
+  // all, so it is neither emitted nor treated as an explicit thinking config
+  // below — `hasThinkingBudget` is the single notion of "thinking was asked
+  // for", shared by the emission and the effort precedence check.
+  // An adaptive-only Claude model rejects a manual budget outright, so the
+  // budget is dropped and — for the effort precedence below — treated as never
+  // having been set, which lets a sibling `effort` through.
+  const isClaude = isClaudeModel(tier.model);
+  let hasThinkingBudget = Boolean(tier.thinking?.budgetTokens);
+  if (hasThinkingBudget && isAdaptiveOnlyClaudeModel(tier.model)) {
+    hasThinkingBudget = false;
+    warnAgentOptionsEffortOnce(
+      `thinking-adaptive-only:${tierName}`,
+      `tier ${tierName}: model '${tier.model}' only accepts adaptive thinking and rejects a manual budget, so thinking.budgetTokens is ignored; use effort instead`,
+      logger,
+    );
+  } else if (tier.thinking?.budgetTokens === 0) {
+    warnAgentOptionsEffortOnce(
+      `thinking-zero:${tierName}`,
+      `tier ${tierName}: thinking.budgetTokens: 0 is ignored`,
+      logger,
+    );
+  }
+
+  // OpenAI reasoning config. Claude models have no such parameters, so they
+  // are dropped there rather than sent to a provider that cannot read them.
+  if (tier.reasoning && isClaude) {
+    if (tier.reasoning.effort || tier.reasoning.summary) {
+      warnAgentOptionsEffortOnce(
+        `reasoning-claude:${tierName}`,
+        `tier ${tierName}: reasoning.effort and reasoning.summary are OpenAI parameters and are ignored for Claude model '${tier.model}'; use effort instead`,
+        logger,
+      );
+    }
+  } else if (tier.reasoning) {
+    if (tier.reasoning.effort) {
+      opts.reasoningEffort = tier.reasoning.effort;
+    }
+  }
+
+  const effort: unknown = tier.effort;
+  if (effort !== undefined) {
+    if (!isEffortLevel(effort)) {
+      // Loading tiers.json rejects this, but an override layer or a
+      // programmatic caller can still hand us junk. Ignore it rather than
+      // failing registration for the whole preset.
+      warnAgentOptionsEffortOnce(
+        `invalid:${tierName}:${String(effort)}`,
+        `tier ${tierName}: invalid effort '${String(effort)}' ignored`,
+        logger,
+      );
+    } else if (isClaude) {
+      if (hasThinkingBudget) {
+        warnAgentOptionsEffortOnce(
+          `anthropic-conflict:${tierName}`,
+          `tier ${tierName}: both thinking and effort set; explicit thinking wins`,
+          logger,
+        );
+      } else {
+        opts.effort = effort;
+      }
+    } else if (isOpenAIModel(tier.model)) {
+      if (tier.reasoning?.effort) {
+        warnAgentOptionsEffortOnce(
+          `openai-conflict:${tierName}`,
+          `tier ${tierName}: both reasoning.effort and effort set; explicit reasoning wins`,
+          logger,
+        );
+      } else if (effort === "xhigh" || effort === "max") {
+        warnAgentOptionsEffortOnce(
+          `openai-downgrade:${tierName}:${effort}`,
+          `tier ${tierName}: downgrading effort '${effort}' to 'high' because OpenAI reasoning_effort only supports low, medium, or high`,
+          logger,
+        );
+        opts.reasoningEffort = "high";
+      } else {
+        opts.reasoningEffort = effort;
+      }
+    } else {
+      warnAgentOptionsEffortOnce(
+        `unknown-provider:${tierName}`,
+        `tier ${tierName}: effort ignored for unknown provider family '${tier.model}'`,
+        logger,
+      );
+    }
+  }
+
+  // Preserve the v2.0.0 bridge's insertion order: ordinary options, then
+  // reasoningEffort, reasoningSummary, thinking. Only emission moves; the
+  // family checks, warning order and explicit-config precedence stay intact.
+  if (!isClaude && tier.reasoning?.summary) {
+    opts.reasoningSummary = tier.reasoning.summary;
+  }
+  if (hasThinkingBudget) {
+    opts.thinking = { type: "enabled", budgetTokens: tier.thinking?.budgetTokens };
+  }
+  return opts;
+}

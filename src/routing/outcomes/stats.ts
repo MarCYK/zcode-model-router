@@ -1,0 +1,873 @@
+// ---------------------------------------------------------------------------
+// Routing statistics (1.3.3, D18): pure `summarize`, deterministic `renderMarkdown`, argument parsing
+// and the CLI driver behind `npm run routing:stats` and `/router stats` (2.4).
+//
+// Design: docs/qa/cost-aware-routing/phase-1.3.md "Design (1.3.1)" §7.
+// No I/O of its own: `runStatsCli` gets every read and write through `StatsCliIO`. Runnable under Node
+// type stripping (type-only imports use `import type`).
+// ---------------------------------------------------------------------------
+
+import type {
+  ClassStatsRow,
+  CostUnit,
+  CostUnitRow,
+  DecisionRow,
+  KeyStatsRow,
+  LogRow,
+  MeanStat,
+  OutcomeKey,
+  OutcomeStoreView,
+  RatioCell,
+  RefusalRow,
+  ResumeFreshRow,
+  RoleStatsTable,
+  RoleTierStatsRow,
+  SavingsRow,
+  SignalKind,
+  SignalKindStats,
+  StatsCliIO,
+  StatsTable,
+  StatsWindow,
+  TokenMeans,
+  VerdictRow,
+} from "./types";
+import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, SIGNAL_KINDS, STATS_EXIT, isAnnotationRow, parseKey } from "./types";
+import { createOutcomeStore } from "./store";
+import { signalMass } from "./signals";
+
+// ---------------------------------------------------------------------------
+// summarize
+// ---------------------------------------------------------------------------
+
+function ratio(num: number, den: number): RatioCell {
+  return { num, den, rate: den === 0 ? null : num / den };
+}
+
+function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function finiteOrNull(x: number | null): number | null {
+  return x !== null && Number.isFinite(x) ? x : null;
+}
+
+function isoOrNull(ms: number | null): string | null {
+  return ms === null ? null : new Date(ms).toISOString();
+}
+
+/** QA-2.2-7: a row the 2.2 adapter lifted to `floorTier` (policy, not an engine decision on evidence). */
+function isFloorLift(row: DecisionRow): boolean {
+  return row.reason.startsWith(FLOOR_LIFT_REASON);
+}
+
+/** QA-INT-2: a first attempt the delegate runner's recorder wrote (its decision ids start with `ladder-`; it has no `best`). */
+function isDelegateAttempt(row: DecisionRow): boolean {
+  return row.decisionID.startsWith("ladder-");
+}
+
+/**
+ * The key a decision row actually dispatched to: `best` when `enforce` switched, else `chosen`. A `switched` row of `shadow`
+ * or `advise` is a would-switch (2.2): nothing was dispatched to `best`, so it must not count as a dispatch there.
+ */
+function dispatchedKey(row: DecisionRow): OutcomeKey {
+  return row.mode === "enforce" && row.switched && row.best !== null ? row.best.key : row.chosen.key;
+}
+
+interface KeyAcc {
+  dispatches: number;
+  attempts: number;
+  pass: number;
+  fail: number;
+  unverifiable: number;
+  falseRefusals: number;
+}
+
+/**
+ * Aggregate the decision log (and, for the cost column, the store) over `since ≤ ts < until`.
+ * `since` is inclusive and `until` exclusive so consecutive periods never double-count. Counts and
+ * rates come only from the windowed rows; the `switched.failed` join looks at all rows, because the
+ * verdict of a switched dispatch may land after `until`. Every rate is a {@link RatioCell}: an empty
+ * denominator is `null`, never NaN.
+ */
+export function summarize(store: OutcomeStoreView | null, rows: readonly LogRow[], window: StatsWindow): StatsTable {
+  // An append may reach disk before reporting failure; retrying that batch must not inflate rates.
+  // Decisions keep their first row. Signals dedupe per outcome, before windowing and joins:
+  // a later decisive verdict must still replace an earlier unverifiable verdict (R2-9).
+  // P1.4: annotation rows (role signals, bindings) are not dispatches; they never reach the tier-mode numbers.
+  const seen = new Set<string>();
+  rows = rows.filter((row) => {
+    if (isAnnotationRow(row)) return false;
+    const id = JSON.stringify(row.kind === "decision"
+      ? [row.kind, row.decisionID]
+      : [row.kind, row.decisionID, row.attemptID, row.kind === "verdict" ? row.verdict : row.overrides ?? null]);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  const since = finiteOrNull(window.since);
+  const until = finiteOrNull(window.until);
+  const inWindow = (row: LogRow): boolean => {
+    const t = Date.parse(row.ts);
+    return Number.isFinite(t) && (since === null || t >= since) && (until === null || t < until);
+  };
+
+  const decisions: DecisionRow[] = [];
+  const verdicts: VerdictRow[] = [];
+  const refusals: RefusalRow[] = [];
+  for (const row of rows) {
+    if (!inWindow(row)) continue;
+    if (row.kind === "decision") decisions.push(row);
+    else if (row.kind === "verdict") verdicts.push(row);
+    else refusals.push(row);
+  }
+  const dispatchRows = decisions.filter((r) => r.step === "dispatch");
+  // QA-2.4-R2-3 / A30: a dispatch that resumes an existing child (`task_id`/`sessionID`) is never switched by the engine, so it says nothing
+  // about routing: every routing metric below (class and key dispatch counts, agreement, switched, savings, the evidence gate) is over the
+  // FRESH dispatches only. Resumes are reported on their own line (`orchestratorResumes`).
+  const freshRows = dispatchRows.filter((r) => !r.resume);
+  const nonPinned = freshRows.filter((r) => !r.pinned);
+
+  // By class.
+  const classCounts = new Map<string, number>();
+  for (const r of freshRows) classCounts.set(r.facts.class, (classCounts.get(r.facts.class) ?? 0) + 1);
+  const byClass: ClassStatsRow[] = [...classCounts.keys()]
+    .sort(compareCodeUnits)
+    .map((cls) => ({ class: cls, dispatches: classCounts.get(cls) ?? 0 }));
+
+  // By key.
+  const accs = new Map<OutcomeKey, KeyAcc>();
+  const slot = (key: OutcomeKey): KeyAcc => {
+    let acc = accs.get(key);
+    if (acc === undefined) {
+      acc = { dispatches: 0, attempts: 0, pass: 0, fail: 0, unverifiable: 0, falseRefusals: 0 };
+      accs.set(key, acc);
+    }
+    return acc;
+  };
+  for (const r of decisions) {
+    const acc = slot(dispatchedKey(r));
+    acc.attempts += 1;
+    if (r.step === "dispatch" && !r.resume) acc.dispatches += 1;
+  }
+  // A refusal belongs to this window's refusal rate only when its decision row is in the window too
+  // (QA-1.3-13); otherwise `falseRefusals / attempts` could pass 100 %. Refusals without a decision id stay.
+  const windowDecisionIDs = new Set(decisions.map((r) => r.decisionID));
+  // QA-2.1-3 / R2-2: a refusal that records `overrides: "pass"` turned a `pass` of the same attempt into a failure,
+  // exactly as the store does (pass → fail, `falseRefusals` + 1). The conversion set comes from every row handed in,
+  // not only the window: the pass row may sit in an earlier window or in a rotated log. A converted attempt's pass is
+  // never counted as a pass; its failure is counted once, with the refusal, whichever window each row is in. Only the
+  // explicit marker counts: a refusal without it (another attempt, or after a fail) is a refusal and nothing else.
+  const converted = new Set<string>();
+  for (const row of rows) if (row.kind === "refusal" && row.overrides === "pass") converted.add(row.attemptID);
+  const decisiveAttempts = new Set(verdicts.filter((v) => v.verdict !== "unverifiable").map((v) => v.attemptID));
+  const effectiveVerdicts: Array<Pick<VerdictRow, "key" | "verdict" | "step" | "attemptID">> = [];
+  const unverifiableSeen = new Set<string>();
+  for (const v of verdicts) {
+    if (v.verdict === "pass" && converted.has(v.attemptID)) continue;
+    if (v.verdict === "unverifiable") {
+      // R2-9: a later pass/fail row for the attempt replaces an earlier unverifiable one; one unverifiable per attempt.
+      if (decisiveAttempts.has(v.attemptID) || unverifiableSeen.has(v.attemptID)) continue;
+      unverifiableSeen.add(v.attemptID);
+    }
+    effectiveVerdicts.push(v);
+  }
+  const countedRefusals: RefusalRow[] = [];
+  const failedByRefusal = new Set<string>();
+  for (const r of refusals) {
+    if (r.decisionID !== null && !windowDecisionIDs.has(r.decisionID)) continue;
+    countedRefusals.push(r);
+    slot(r.key).falseRefusals += 1;
+    if (r.overrides === "pass" && !failedByRefusal.has(r.attemptID)) {
+      failedByRefusal.add(r.attemptID);
+      effectiveVerdicts.push({ key: r.key, verdict: "fail", step: r.step, attemptID: r.attemptID });
+    }
+  }
+  for (const v of effectiveVerdicts) slot(v.key)[v.verdict] += 1;
+  const byKey: KeyStatsRow[] = [...accs.keys()].sort(compareCodeUnits).map((key) => {
+    const acc = accs.get(key) ?? { dispatches: 0, attempts: 0, pass: 0, fail: 0, unverifiable: 0, falseRefusals: 0 };
+    const measured = store === null ? null : store.cost(key).measuredUSD;
+    return {
+      key,
+      dispatches: acc.dispatches,
+      attempts: acc.attempts,
+      pass: acc.pass,
+      fail: acc.fail,
+      unverifiable: acc.unverifiable,
+      passRate: ratio(acc.pass, acc.pass + acc.fail),
+      falseRefusals: acc.falseRefusals,
+      refusalRate: ratio(Math.min(acc.falseRefusals, acc.attempts), acc.attempts),
+      measuredUSD: measured !== null && measured.n > 0 ? { mean: measured.mean, n: measured.n } : null,
+    };
+  });
+
+  // Agreement: best == chosen over non-pinned dispatches that have a best.
+  // QA-INT-2 / QA-2.2-R2-3: the rows the kernel decided: a `best` exists and the dispatch is not a floor lift (policy, whose `best` is the
+  // lifted tier, not an argmin). Delegate first attempts (the runner's recorder rows, `best: null`) and lifts are counted on their own lines.
+  const routedRows = nonPinned.filter((r) => r.best !== null && !isFloorLift(r));
+  const agreement = ratio(routedRows.filter((r) => r.best !== null && r.best.key === r.chosen.key).length, routedRows.length);
+
+  // Switched, and how many of those ended in a fail verdict or a false refusal (any window).
+  const failedDecisionIDs = new Set<string>();
+  const decidedDecisionIDs = new Set<string>(); // a pass/fail verdict or a refusal exists: the outcome is known
+  for (const row of rows) {
+    if (row.kind === "verdict" && row.decisionID !== null) {
+      if (row.verdict === "fail") failedDecisionIDs.add(row.decisionID);
+      if (row.verdict !== "unverifiable") decidedDecisionIDs.add(row.decisionID);
+    } else if (row.kind === "refusal" && row.decisionID !== null) {
+      failedDecisionIDs.add(row.decisionID);
+      decidedDecisionIDs.add(row.decisionID);
+    }
+  }
+  const switchedRows = routedRows.filter((r) => r.switched);
+  // QA-2.2-7/8: D17 asks whether a dispatch the engine moved ON ITS OWN EVIDENCE failed. A shadow/advise row is a would-switch (nothing
+  // moved) and a floor lift is policy, so neither can be a failed switch.
+  const enforcedSwitches = switchedRows.filter((r) => r.mode === "enforce");
+
+  // Savings: Σ C(chosen) − C(best) per unit, never summed across units. Summed in ascending order so
+  // the total does not depend on the row order.
+  const terms = new Map<CostUnit, number[]>();
+  for (const r of routedRows) {
+    if (r.best === null) continue;
+    const chosenCost = r.costs[r.chosen.key];
+    const bestCost = r.costs[r.best.key];
+    if (typeof chosenCost !== "number" || typeof bestCost !== "number") continue;
+    if (!Number.isFinite(chosenCost) || !Number.isFinite(bestCost)) continue;
+    const list = terms.get(r.unit) ?? [];
+    list.push(chosenCost - bestCost);
+    terms.set(r.unit, list);
+  }
+  const savings: SavingsRow[] = [...terms.keys()].sort(compareCodeUnits).map((unit) => {
+    const list = [...(terms.get(unit) ?? [])].sort((a, b) => a - b);
+    return { unit, total: list.reduce((sum, x) => sum + x, 0), rows: list.length };
+  });
+
+  // Variant steps.
+  const variantVerdicts = effectiveVerdicts.filter((v) => v.step === "variant");
+  const variantPass = variantVerdicts.filter((v) => v.verdict === "pass").length;
+  // R2-3: a refusal that was an attempt's first terminal signal is a variant failure in the store (`variantFail`), though it has
+  // no verdict row; one after a verdict, or a conversion (already a synthetic fail above), adds nothing.
+  const decidedAttempts = new Set(effectiveVerdicts.filter((v) => v.verdict !== "unverifiable").map((v) => v.attemptID));
+  let variantRefusalFails = 0;
+  for (const r of countedRefusals) {
+    if (r.step !== "variant" || decidedAttempts.has(r.attemptID)) continue;
+    decidedAttempts.add(r.attemptID);
+    variantRefusalFails += 1;
+  }
+  const variantFail = variantVerdicts.filter((v) => v.verdict === "fail").length + variantRefusalFails;
+
+  const resumeVsFresh: ResumeFreshRow[] = LADDER_STEP_KINDS.map((step) => {
+    const ofStep = decisions.filter((r) => r.step === step);
+    const resume = ofStep.filter((r) => r.resume).length;
+    return { step, resume, fresh: ofStep.length - resume };
+  });
+
+  // 2.4: the orchestrator's own resumes (2.2 `task_id`/`sessionID`) and the A27 evidence gate, over the routed dispatch rows.
+  const routedDispatches = dispatchRows.filter((r) => !isDelegateAttempt(r)); // fresh and resumed: the resume line's denominator
+  const routedFresh = routedDispatches.filter((r) => !r.resume);
+  const argminCounts = new Map<OutcomeKey, number>();
+  for (const r of routedFresh) {
+    const key = r.trace?.argmin?.key;
+    if (key !== undefined) argminCounts.set(key, (argminCounts.get(key) ?? 0) + 1);
+  }
+  const argmin = [...argminCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || compareCodeUnits(a[0], b[0]))
+    .map(([key, count]) => ({ key, count }));
+
+  // A34 (QA-G-B8): D9 never-down audit. High-risk rows decided without detection that record both capability ranks; `below` = those that
+  // ran below the pick's capability rank. Rows written before A34 (no `detection`/`capability`) are tolerated and left out.
+  const isRank = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+  const audited: Array<{ readonly pick: number; readonly dispatched: number }> = [];
+  for (const r of routedDispatches) {
+    const capability = r.capability;
+    if (r.facts.risk !== "high" || r.detection?.effective !== "none" || capability === undefined) continue;
+    if (isRank(capability.pick) && isRank(capability.dispatched)) audited.push({ pick: capability.pick, dispatched: capability.dispatched });
+  }
+  const neverDownBelow = audited.filter((ranks) => ranks.dispatched < ranks.pick).length;
+
+  return {
+    version: 1,
+    window: { since: isoOrNull(since), until: isoOrNull(until) },
+    dispatches: dispatchRows.length,
+    routed: dispatchRows.filter((r) => !isDelegateAttempt(r)).length,
+    delegateFirstAttempts: dispatchRows.filter(isDelegateAttempt).length,
+    floorLifts: dispatchRows.filter(isFloorLift).length,
+    pinned: dispatchRows.filter((r) => r.pinned).length,
+    byClass,
+    byKey,
+    agreement,
+    switched: {
+      count: switchedRows.length,
+      share: ratio(switchedRows.length, routedRows.length),
+      enforced: enforcedSwitches.length,
+      failed: enforcedSwitches.filter((r) => failedDecisionIDs.has(r.decisionID)).length,
+      verified: enforcedSwitches.filter((r) => decidedDecisionIDs.has(r.decisionID)).length,
+    },
+    savings,
+    variantSteps: {
+      taken: decisions.filter((r) => r.step === "variant").length,
+      passRate: ratio(variantPass, variantPass + variantFail),
+    },
+    resumeVsFresh,
+    orchestratorResumes: { resumed: routedDispatches.filter((r) => r.resume).length, total: routedDispatches.length },
+    gate: { keptEvidence: routedFresh.filter((r) => r.reason.startsWith("kept:evidence")).length, argmin },
+    neverDown: { below: neverDownBelow, recorded: audited.length },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// summarizeRoles (P1.4): role × tier statistics; computation only, rendering is P2.2
+// ---------------------------------------------------------------------------
+
+const UNKNOWN_TIER = "unknown";
+
+/**
+ * Role of a decision row: its `role`, else the agent of its dispatched key when that key has origin `role` (QA-P14-2-5:
+ * a role dispatch row written without `role` is still the role's; P2.1 should write `role` anyway).
+ */
+function roleOf(row: DecisionRow): string | undefined {
+  if (row.role !== undefined) return row.role;
+  const parts = parseKey(dispatchedKey(row));
+  return parts !== null && parts.agent.origin === "role" ? parts.agent.id : undefined;
+}
+
+interface RoleTierAcc {
+  readonly role: string;
+  readonly tier: string;
+  dispatches: number;
+  explored: number;
+  unknownBindings: number;
+  readonly signals: Map<SignalKind, { pass: number; fail: number; none: number; positive: number; negative: number }>;
+  readonly keys: Set<OutcomeKey>;
+  readonly costs: Map<CostUnit, number[]>;
+}
+
+/** Ascending-order sum, so a total never depends on the row order. */
+function stableSum(values: readonly number[]): number {
+  return [...values].sort((a, b) => a - b).reduce((sum, x) => sum + x, 0);
+}
+
+function pooledTokens(store: OutcomeStoreView, keys: ReadonlySet<OutcomeKey>): TokenMeans | null {
+  let n = 0;
+  const sums = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  for (const key of [...keys].sort(compareCodeUnits)) {
+    const t = store.cost(key).tokens;
+    if (t.n <= 0) continue;
+    n += t.n;
+    sums.input += t.input * t.n;
+    sums.output += t.output * t.n;
+    sums.reasoning += t.reasoning * t.n;
+    sums.cacheRead += t.cacheRead * t.n;
+    sums.cacheWrite += t.cacheWrite * t.n;
+  }
+  if (n === 0) return null;
+  return {
+    n,
+    input: sums.input / n,
+    output: sums.output / n,
+    reasoning: sums.reasoning / n,
+    cacheRead: sums.cacheRead / n,
+    cacheWrite: sums.cacheWrite / n,
+  };
+}
+
+function pooledUSD(store: OutcomeStoreView, keys: ReadonlySet<OutcomeKey>): MeanStat | null {
+  let n = 0;
+  let sum = 0;
+  for (const key of [...keys].sort(compareCodeUnits)) {
+    const m = store.cost(key).measuredUSD;
+    if (m.n <= 0) continue;
+    n += m.n;
+    sum += m.mean * m.n;
+  }
+  return n === 0 ? null : { mean: sum / n, n };
+}
+
+/**
+ * Role × tier statistics over `since ≤ ts < until`. Only rows of role dispatches count: a dispatch row is a non-annotation
+ * `dispatch` decision row with a role (`role`, else a role-origin dispatched key: {@link roleOf}); signal rows and unknown-binding rows are attributed to the role
+ * and tier of the dispatch row they join on `decisionID` (any window: the dispatch may precede the window), else to their
+ * own `role`/`tier`. Rows are deduplicated like `summarize` (C7): the first dispatch row per decision id, and identical
+ * annotation rows once. Signal masses are clamped per kind (`signalMass`): I6 and I7 hold whatever a row claims.
+ * Tokens and USD come from the store (lifetime per attempt, like `KeyStatsRow.measuredUSD`).
+ */
+export function summarizeRoles(store: OutcomeStoreView | null, rows: readonly LogRow[], window: StatsWindow): RoleStatsTable {
+  const since = finiteOrNull(window.since);
+  const until = finiteOrNull(window.until);
+  const inWindow = (row: LogRow): boolean => {
+    const t = Date.parse(row.ts);
+    return Number.isFinite(t) && (since === null || t >= since) && (until === null || t < until);
+  };
+
+  const dispatchByID = new Map<string, DecisionRow>();
+  const annotations: DecisionRow[] = [];
+  const seenNotes = new Set<string>();
+  // Residual QA-P14-1-6: a refusal that records `overrides: "pass"` turned the attempt's store pass into a failure (as
+  // `summarize` moves that pass to a fail). The attempt's `verdict:pass` signal then counts as a failure of 1, and its
+  // `grader:pass` signal (#84 P3.3 fix 2: grader verdicts follow the store too) as a failure of the grader's 0.5. Every row
+  // handed in, not only the window: the refusal may land in another window than the signal.
+  const converted = new Set<string>();
+  for (const row of rows) if (row.kind === "refusal" && row.overrides === "pass") converted.add(row.attemptID);
+  for (const row of rows) {
+    if (row.kind !== "decision") continue;
+    if (isAnnotationRow(row)) {
+      // Signals: one row per attempt and kind, first wins (ingest's own identity and the store's one-observation rule);
+      // `attemptID` when the row carries it, else the child session. Other annotations: per attempt and reason.
+      const attempt = row.attemptID ?? row.childSessionID;
+      const id = JSON.stringify(row.signal !== undefined
+        ? ["signal", row.decisionID, attempt, row.signal]
+        : ["note", row.decisionID, attempt, row.reason, row.binding ?? null]);
+      if (seenNotes.has(id)) continue;
+      seenNotes.add(id);
+      annotations.push(row);
+    } else if (!dispatchByID.has(row.decisionID)) {
+      dispatchByID.set(row.decisionID, row);
+    }
+  }
+
+  const buckets = new Map<string, RoleTierAcc>();
+  const bucket = (role: string, tier: string): RoleTierAcc => {
+    const id = JSON.stringify([role, tier]);
+    let acc = buckets.get(id);
+    if (acc === undefined) {
+      acc = { role, tier, dispatches: 0, explored: 0, unknownBindings: 0, signals: new Map(), keys: new Set(), costs: new Map() };
+      buckets.set(id, acc);
+    }
+    return acc;
+  };
+  /**
+   * Role and tier of an annotation: when its dispatch row exists, that row's role AND tier only (a dispatch without a role
+   * is tier mode: unattributed); else the annotation's own. Null without a role.
+   */
+  const placeOf = (row: DecisionRow): RoleTierAcc | null => {
+    const dispatch = dispatchByID.get(row.decisionID);
+    const source = dispatch ?? row;
+    const role = roleOf(source);
+    if (role === undefined) return null;
+    return bucket(role, source.tier ?? UNKNOWN_TIER);
+  };
+
+  const unknownBindingSeen = new Set<string>();
+  const noteUnknownBinding = (row: DecisionRow, acc: RoleTierAcc | null): boolean => {
+    if (row.binding !== "unknown") return false;
+    const id = JSON.stringify([row.decisionID, row.childSessionID]);
+    if (unknownBindingSeen.has(id)) return false;
+    unknownBindingSeen.add(id);
+    if (acc !== null) acc.unknownBindings += 1;
+    return acc === null;
+  };
+
+  let unattributedSignals = 0;
+  let unattributedBindings = 0;
+  for (const row of dispatchByID.values()) {
+    const role = roleOf(row);
+    if (!inWindow(row) || role === undefined) continue;
+    const acc = bucket(role, row.tier ?? UNKNOWN_TIER);
+    if (noteUnknownBinding(row, acc)) unattributedBindings += 1;
+    if (row.step !== "dispatch") continue;
+    acc.dispatches += 1;
+    if (row.explore === true) acc.explored += 1;
+    const key = dispatchedKey(row);
+    acc.keys.add(key);
+    const cost = row.costs[key];
+    if (typeof cost === "number" && Number.isFinite(cost)) {
+      const list = acc.costs.get(row.unit) ?? [];
+      list.push(cost);
+      acc.costs.set(row.unit, list);
+    }
+  }
+  for (const row of annotations) {
+    if (!inWindow(row)) continue;
+    const acc = placeOf(row);
+    if (noteUnknownBinding(row, acc)) unattributedBindings += 1;
+    const kind = row.signal;
+    if (kind === undefined) continue;
+    if (acc === null) {
+      unattributedSignals += 1;
+      continue;
+    }
+    const cell = acc.signals.get(kind) ?? { pass: 0, fail: 0, none: 0, positive: 0, negative: 0 };
+    const overridden = (kind === "verdict" || kind === "grader") && row.attemptID !== undefined && converted.has(row.attemptID) && (row.signalWeight ?? 0) > 0;
+    const mass = signalMass(kind, overridden ? -1 : row.signalWeight);
+    if (mass.positive > 0) cell.pass += 1;
+    else if (mass.negative > 0) cell.fail += 1;
+    else cell.none += 1;
+    cell.positive += mass.positive;
+    cell.negative += mass.negative;
+    acc.signals.set(kind, cell);
+  }
+
+  const byRoleTier: RoleTierStatsRow[] = [...buckets.values()]
+    .sort((a, b) => compareCodeUnits(a.role, b.role) || compareCodeUnits(a.tier, b.tier))
+    .map((acc) => {
+      const signals: SignalKindStats[] = SIGNAL_KINDS.map((kind) => ({
+        kind,
+        ...(acc.signals.get(kind) ?? { pass: 0, fail: 0, none: 0, positive: 0, negative: 0 }),
+      }));
+      const costUnits: CostUnitRow[] = [...acc.costs.keys()].sort(compareCodeUnits).map((unit) => {
+        const list = acc.costs.get(unit) ?? [];
+        return { unit, total: stableSum(list), rows: list.length };
+      });
+      const count = (kind: SignalKind): number => {
+        const s = acc.signals.get(kind);
+        return s === undefined ? 0 : s.pass + s.fail + s.none;
+      };
+      return {
+        role: acc.role,
+        tier: acc.tier,
+        dispatches: acc.dispatches,
+        signals,
+        positiveMass: stableSum(signals.map((s) => s.positive)),
+        negativeMass: stableSum(signals.map((s) => s.negative)),
+        budgetExhaustions: count("budget"),
+        authorityRequests: count("authority"),
+        unknownBindings: acc.unknownBindings,
+        explored: acc.explored,
+        tokensPerDispatch: store === null ? null : pooledTokens(store, acc.keys),
+        measuredUSD: store === null ? null : pooledUSD(store, acc.keys),
+        costUnits,
+      };
+    });
+
+  return {
+    version: 1,
+    window: { since: isoOrNull(since), until: isoOrNull(until) },
+    byRoleTier,
+    unattributed: { signals: unattributedSignals, unknownBindings: unattributedBindings },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// renderMarkdown
+// ---------------------------------------------------------------------------
+
+/** D17 / DF5: apply to the enforce-period summary; any failed enforced switch returns to advise. */
+export function d17Mode(summary: Pick<StatsTable, "switched">): "enforce" | "advise" | "n/a (0 enforced switches)" {
+  if (summary.switched.enforced === 0) return "n/a (0 enforced switches)";
+  return summary.switched.failed === 0 ? "enforce" : "advise";
+}
+
+/** `toFixed` without `-0.00`. */
+function fix(x: number, digits: number): string {
+  return (Math.abs(x) < 0.5 * 10 ** -digits ? 0 : x).toFixed(digits);
+}
+
+function fmtRatio(cell: RatioCell): string {
+  return cell.den === 0 ? "n/a" : `${cell.num}/${cell.den} (${((100 * cell.num) / cell.den).toFixed(1)}%)`;
+}
+
+function fmtPercent(cell: RatioCell): string {
+  return cell.rate === null ? "n/a" : `${(100 * cell.rate).toFixed(1)}%`;
+}
+
+function fmtUSD(x: number): string {
+  return `$${fix(x, 4)}`;
+}
+
+function fmtRatioAmount(x: number): string {
+  return fix(x, 2);
+}
+
+/** Keys contain `|`; a cell must neither break the table nor span lines. */
+function cell(text: string): string {
+  return text.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
+/**
+ * Markdown report: `\n` only, blocks separated by exactly one blank line, exactly one trailing `\n`.
+ * Deterministic: the same table always renders the same bytes.
+ */
+export function renderMarkdown(table: StatsTable): string {
+  const metrics = [
+    "| Metric | Value |",
+    "|---|---|",
+    `| Dispatches | ${table.dispatches} |`,
+    `| Routed dispatches | ${table.routed} |`,
+    `| Delegate first attempts | ${table.delegateFirstAttempts} |`,
+    `| Floor lifts | ${table.floorLifts} |`,
+    `| Pinned | ${table.pinned} |`,
+    `| Agreement (best == chosen, non-pinned) | ${fmtRatio(table.agreement)} |`,
+    `| Switched | ${table.switched.count} of ${table.switched.share.den} non-pinned routed (${fmtPercent(table.switched.share)}); enforced ${table.switched.enforced}; failed ${table.switched.failed} (verified ${table.switched.verified} of ${table.switched.enforced} enforced) |`,
+    `| D17 mode (use the DF4→DF5 enforce-period window) | ${d17Mode(table)} |`,
+    ...(table.savings.length === 0
+      ? ["| Estimated savings | n/a |"]
+      : table.savings.map(
+          (s) =>
+            `| Estimated savings (${s.unit}) | ${s.unit === "usd" ? fmtUSD(s.total) : fmtRatioAmount(s.total)} over ${s.rows} rows |`,
+        )),
+    `| Variant steps | ${table.variantSteps.taken} taken; pass ${fmtRatio(table.variantSteps.passRate)} |`,
+    // 2.4: not ladder decisions, so they are not rows of the D11 table below (QA-2.3-7).
+    `| Orchestrator resumes (task_id / sessionID; not a ladder step, never switched, outside every routing metric) | ${table.orchestratorResumes.resumed} of ${table.orchestratorResumes.total} routed dispatches |`,
+    `| Kept for lack of evidence (A27, fresh dispatches) | ${table.gate.keptEvidence} of ${table.orchestratorResumes.total - table.orchestratorResumes.resumed} fresh routed dispatches |`,
+    // A34 (QA-G-B8): the never-down audit. `n/a` when no row of the window records detection and both capability ranks.
+    `| High-risk d=none rows that ran below the pick's capability rank (D9 never-down, A34; expected 0) | ${
+      table.neverDown.recorded === 0 ? "n/a (no row records detection and capability)" : `${table.neverDown.below} of ${table.neverDown.recorded} recorded`
+    } |`,
+  ];
+
+  const classTable =
+    table.byClass.length === 0
+      ? "_none_"
+      : ["| Class | Dispatches |", "|---|---|", ...table.byClass.map((r) => `| ${cell(r.class)} | ${r.dispatches} |`)].join("\n");
+
+  const keyTable =
+    table.byKey.length === 0
+      ? "_none_"
+      : [
+          "| Key | Dispatches | Attempts | Pass | Fail | Unverifiable | Pass rate | False refusals | Refusal rate | USD/attempt (lifetime) |",
+          "|---|---|---|---|---|---|---|---|---|---|",
+          ...table.byKey.map(
+            (r) =>
+              `| ${cell(r.key)} | ${r.dispatches} | ${r.attempts} | ${r.pass} | ${r.fail} | ${r.unverifiable} | ${fmtRatio(r.passRate)} | ${r.falseRefusals} | ${fmtRatio(r.refusalRate)} | ${
+                r.measuredUSD === null ? "n/a" : `${fmtUSD(r.measuredUSD.mean)} (n=${r.measuredUSD.n})`
+              } |`,
+          ),
+        ].join("\n");
+
+  // QA-2.3-7: the rendered table is the ladder's. `dispatch` counts first dispatches (always fresh for `delegate`) and the
+  // `sessionID`/`task_id` resumes of dispatched subagents, neither of which is a D11 ladder decision, so its row is left out
+  // here; `resumeVsFresh` itself (and `--json`) keeps it, so those numbers stay countable.
+  const resumeTable = [
+    "| Step | Resume | Fresh |",
+    "|---|---|---|",
+    ...table.resumeVsFresh.filter((r) => r.step !== "dispatch").map((r) => `| ${r.step} | ${r.resume} | ${r.fresh} |`),
+  ].join("\n");
+
+  // A27 / DF3: the cheapest option the evidence filter held back (`trace.argmin`), i.e. where the gate stops the engine.
+  const argminTable =
+    table.gate.argmin.length === 0
+      ? "_none_"
+      : ["| Cheapest key held back | Rows |", "|---|---|", ...table.gate.argmin.map((r) => `| ${cell(r.key)} | ${r.count} |`)].join("\n");
+
+  const blocks = [
+    "## Routing stats",
+    `Window: ${table.window.since ?? "start"} → ${table.window.until ?? "open"}`,
+    metrics.join("\n"),
+    "### By class",
+    classTable,
+    "### By key",
+    keyTable,
+    "### Gated by evidence (trace.argmin)",
+    argminTable,
+    "### Resume vs fresh",
+    resumeTable,
+    // QA-2.1-10: rows are only recorded under a trusted class, so the rates below the metrics are not over every dispatch.
+    "_Verdict and false-refusal rates cover trusted classes only: dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. Other dispatches have a decision row but no verdict or refusal rows, so Dispatches can exceed Pass + Fail + Unverifiable by design._",
+  ];
+  return blocks.join("\n\n") + "\n";
+}
+
+/**
+ * True when the log has role rows: a role dispatch bucket, or an unknown-binding row (only role dispatches are bound). Unattributed
+ * SIGNAL rows do not count: tier-origin verdict/run signals are written in every mode, so tier-only logs render exactly as before.
+ */
+export function hasRoleRows(table: RoleStatsTable): boolean {
+  return table.byRoleTier.length > 0 || table.unattributed.unknownBindings > 0;
+}
+
+/** P2.2: the role × tier section appended to the report when the log has role rows. Same determinism rules as {@link renderMarkdown}. */
+export function renderRoleMarkdown(table: RoleStatsTable): string {
+  const rows =
+    table.byRoleTier.length === 0
+      ? "_none_"
+      : [
+          "| Role | Tier | Dispatches | Pass | Fail | +mass | -mass | Budget exhaustions | Authority requests | Unknown bindings | Explored | Tokens/dispatch (in/out) | USD/attempt (lifetime) |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+          ...table.byRoleTier.map((r) => {
+            const pass = r.signals.reduce((sum, s) => sum + s.pass, 0);
+            const fail = r.signals.reduce((sum, s) => sum + s.fail, 0);
+            const tokens = r.tokensPerDispatch === null ? "n/a" : `${fix(r.tokensPerDispatch.input, 0)}/${fix(r.tokensPerDispatch.output, 0)} (n=${r.tokensPerDispatch.n})`;
+            const usd = r.measuredUSD === null ? "n/a" : `${fmtUSD(r.measuredUSD.mean)} (n=${r.measuredUSD.n})`;
+            return `| ${cell(r.role)} | ${cell(r.tier)} | ${r.dispatches} | ${pass} | ${fail} | ${fix(r.positiveMass, 2)} | ${fix(r.negativeMass, 2)} | ${r.budgetExhaustions} | ${r.authorityRequests} | ${r.unknownBindings} | ${r.explored} | ${tokens} | ${usd} |`;
+          }),
+        ].join("\n");
+  const blocks = ["### By role × tier", rows];
+  if (table.unattributed.signals > 0 || table.unattributed.unknownBindings > 0) {
+    blocks.push(`_Not attributed to a role: ${table.unattributed.signals} signal row(s), ${table.unattributed.unknownBindings} unknown binding(s)._`);
+  }
+  return blocks.join("\n\n") + "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Arguments and CLI
+// ---------------------------------------------------------------------------
+
+export interface StatsArgs {
+  readonly since: number | null;
+  readonly until: number | null;
+  readonly json: boolean;
+  readonly dir: string | null;
+  readonly help: boolean;
+}
+
+export type ParseStatsResult =
+  | { readonly ok: true; readonly args: StatsArgs }
+  | { readonly ok: false; readonly error: string };
+
+export const USAGE = [
+  "Usage: node scripts/routing-stats.ts [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]",
+  "   or: npm run routing:stats -- [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]",
+  `       (PowerShell swallows a bare "--": write npm run routing:stats '--' --since <ISO>)`,
+  "  --since <ISO>  include rows with ts >= since (YYYY-MM-DD, or date-time with Z or an offset)",
+  "  --until <ISO>  include rows with ts < until",
+  "  --json         print the StatsTable as JSON",
+  "  --dir <path>   outcome directory, resolved like routing.outcomes.path: ~ is the home directory and a",
+  "                 relative path is taken under <os tmpdir>/opencode-model-router-trajectory",
+  "                 (default: <os tmpdir>/opencode-model-router-trajectory)",
+  "",
+].join("\n");
+
+const ISO_RE = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(Z|[+-](\d{2}):(\d{2})))?$/;
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/** Epoch ms of an ISO date or zoned date-time, or an error text. A zone-less date-time is refused (it would be machine-dependent). */
+function parseInstant(flag: string, value: string): { readonly ms: number } | { readonly error: string } {
+  const m = ISO_RE.exec(value);
+  if (m === null) {
+    return {
+      error: `invalid ${flag} value "${value}": expected YYYY-MM-DD or a date-time with Z or an offset (e.g. 2026-10-06T12:00:00Z)`,
+    };
+  }
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const hour = m[4] === undefined ? 0 : Number(m[4]);
+  const minute = m[5] === undefined ? 0 : Number(m[5]);
+  const second = m[6] === undefined ? 0 : Number(m[6]);
+  const offsetHour = m[8] === undefined ? 0 : Number(m[8]);
+  const offsetMinute = m[9] === undefined ? 0 : Number(m[9]);
+  const calendarOk =
+    month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth(year, month) && hour <= 23 && minute <= 59 && second <= 59 && offsetHour <= 23 && offsetMinute <= 59;
+  const ms = calendarOk ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(ms)) return { error: `invalid ${flag} value "${value}": not a real date` };
+  return { ms };
+}
+
+/** `--since <v>`/`--since=<v>` (also `--until`, `--dir`), `--json`, `--help`/`-h`. Repeats, unknown arguments and an empty window are errors. */
+export function parseStatsArgs(argv: readonly string[]): ParseStatsResult {
+  let since: number | null = null;
+  let until: number | null = null;
+  let json = false;
+  let dir: string | null = null;
+  let help = false;
+  const seen = new Set<string>();
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] as string;
+    const eq = arg.startsWith("--") ? arg.indexOf("=") : -1;
+    const rawName = eq > 0 ? arg.slice(0, eq) : arg;
+    const inline = eq > 0 ? arg.slice(eq + 1) : null;
+    const name = rawName === "-h" ? "--help" : rawName;
+
+    if (name === "--json" || name === "--help") {
+      if (inline !== null) return { ok: false, error: `${name} does not take a value` };
+      if (seen.has(name)) return { ok: false, error: `${name} given more than once` };
+      seen.add(name);
+      if (name === "--json") json = true;
+      else help = true;
+      continue;
+    }
+    if (name !== "--since" && name !== "--until" && name !== "--dir") return { ok: false, error: `unknown argument: ${arg}` };
+    if (seen.has(name)) return { ok: false, error: `${name} given more than once` };
+    seen.add(name);
+
+    let value: string | null = inline;
+    if (value === null) {
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        value = next;
+        i += 1;
+      }
+    }
+    if (value === null || value === "") return { ok: false, error: `${name} requires a value` };
+
+    if (name === "--dir") {
+      dir = value;
+      continue;
+    }
+    const parsed = parseInstant(name, value);
+    if ("error" in parsed) return { ok: false, error: parsed.error };
+    if (name === "--since") since = parsed.ms;
+    else until = parsed.ms;
+  }
+
+  if (since !== null && until !== null && since >= until) {
+    return { ok: false, error: "--since must be earlier than --until" };
+  }
+  return { ok: true, args: { since, until, json, dir, help } };
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * `routing:stats` driver. Read-only: loads without quarantine, cleanup or mkdir. Never throws:
+ * a usage error exits 2, a corrupt or too-new store exits 1 with a clear message, an unexpected error
+ * writes `routing-stats: <message>` and exits 1. A missing store is an empty table with exit 0.
+ */
+export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Promise<number> {
+  try {
+    const parsed = parseStatsArgs(argv);
+    if (!parsed.ok) {
+      io.stderr(`routing-stats: ${parsed.error}\n${USAGE}`);
+      return STATS_EXIT.usage;
+    }
+    const { args } = parsed;
+    if (args.help) {
+      io.stdout(USAGE);
+      return STATS_EXIT.ok;
+    }
+
+    const source = io.open(args.dir ?? io.defaultDir);
+    const loaded = await source.load({ quarantine: false });
+    if (loaded.status === "corrupt" || loaded.status === "unsupported-version") {
+      io.stderr(`routing-stats: corrupted outcome store: ${loaded.message ?? loaded.status}\n`);
+      return STATS_EXIT.corrupt;
+    }
+    if (loaded.dropped > 0) io.stderr(`routing-stats: warning: ${loaded.message ?? `${loaded.dropped} invalid store entries dropped`}\n`);
+
+    const store = createOutcomeStore();
+    if (loaded.status === "ok") store.fromSnapshot(loaded.snapshot);
+    const read = await source.readRows();
+    if (loaded.status === "missing" && read.files.length === 0) {
+      // Not an error (a fresh install has nothing yet), but a typo in --dir looks exactly like this (QA-1.3-5).
+      io.stderr(`routing-stats: no outcome data in ${source.dir}\n`);
+    }
+    if (read.skipped > 0) io.stderr(`routing-stats: skipped ${read.skipped} unreadable decision-log line(s)\n`);
+    if (
+      read.generations >= DECISIONS_MAX_GENERATIONS &&
+      read.oldestTs !== null &&
+      (args.since === null || args.since < Date.parse(read.oldestTs))
+    ) {
+      // Rotation prunes only beyond DECISIONS_MAX_GENERATIONS rotated files, so fewer than that means nothing has
+      // been dropped yet (QA-1.3-19). At the limit, history before the oldest retained row may be gone (QA-1.3-10).
+      io.stderr(
+        `routing-stats: warning: the decision log has rotated; its oldest retained row is ${read.oldestTs}, so ${
+          args.since === null ? "an unbounded" : "this"
+        } window may be incomplete\n`,
+      );
+    }
+
+    const table = summarize(store, read.rows, { since: args.since, until: args.until });
+    const roles = summarizeRoles(store, read.rows, { since: args.since, until: args.until });
+    const withRoles = hasRoleRows(roles);
+    io.stdout(
+      args.json
+        ? JSON.stringify(withRoles ? { ...table, roles } : table, null, 2) + "\n"
+        : withRoles
+          ? `${renderMarkdown(table)}\n${renderRoleMarkdown(roles)}`
+          : renderMarkdown(table),
+    );
+    return STATS_EXIT.ok;
+  } catch (error) {
+    try {
+      io.stderr(`routing-stats: ${messageOf(error)}\n`);
+    } catch {
+      return STATS_EXIT.corrupt;
+    }
+    return STATS_EXIT.corrupt;
+  }
+}
